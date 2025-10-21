@@ -1,0 +1,50 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>邮件汇总系统 - 日志</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+  <header>
+    <h1>系统日志</h1>
+    <nav>
+      <a href="{{ url_for('index') }}">首页</a> |
+      <a href="{{ url_for('config_page') }}">配置</a> |
+      <a href="{{ url_for('logs_page') }}">日志</a>
+    </nav>
+  </header>
+  <main>
+    <section>
+      {% set fail_count = logs|selectattr('success', 'equalto', False)|list|length %}
+      <p>共有 {{ logs|length }} 条记录，其中失败 {{ fail_count }} 次。</p>
+      {% if logs %}
+        <table class="log-table">
+          <thead>
+            <tr>
+              <th>时间</th>
+              <th>状态</th>
+              <th>信息</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for log in logs|reverse %}
+              <tr class="{% if not log.success %}fail-row{% endif %}">
+                <td>{{ log.time }}</td>
+                <td>{% if log.success %}成功{% else %}失败{% endif %}</td>
+                <td>{{ log.message }}</td>
+              </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      {% else %}
+        <p>暂无日志记录。</p>
+      {% endif %}
+    </section>
+  </main>
+  <footer>
+    <p>&copy; 2025 邮件汇总系统</p>
+  </footer>
+</body>
+</html>

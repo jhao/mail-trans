@@ -1,0 +1,51 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>邮件汇总系统 - 配置</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+  <header>
+    <h1>系统配置</h1>
+    <nav>
+      <a href="{{ url_for('index') }}">首页</a> |
+      <a href="{{ url_for('config_page') }}">配置</a> |
+      <a href="{{ url_for('logs_page') }}">日志</a>
+    </nav>
+  </header>
+  <main>
+    {% with messages = get_flashed_messages() %}
+      {% if messages %}
+        <ul class="flash-messages">
+        {% for message in messages %}
+          <li>{{ message }}</li>
+        {% endfor %}
+        </ul>
+      {% endif %}
+    {% endwith %}
+    <form method="post" class="config-form">
+      <h2>IMAP 邮箱配置</h2>
+      <label>IMAP 服务器地址：<input type="text" name="imap_host" value="{{ config.get('imap_host','') }}"></label>
+      <label>IMAP 端口：<input type="text" name="imap_port" value="{{ config.get('imap_port','993') }}"></label>
+      <label>邮箱账号：<input type="text" name="imap_user" value="{{ config.get('imap_user','') }}"></label>
+      <label>邮箱密码/授权码：<input type="password" name="imap_pass" value="{{ config.get('imap_pass','') }}"></label>
+      <h2>SMTP 发件配置</h2>
+      <label>SMTP 服务器地址：<input type="text" name="smtp_host" value="{{ config.get('smtp_host','') }}"></label>
+      <label>SMTP 端口：<input type="text" name="smtp_port" value="{{ config.get('smtp_port','465') }}"></label>
+      <label>SMTP 用户名：<input type="text" name="smtp_user" value="{{ config.get('smtp_user','') }}"></label>
+      <label>SMTP 密码/授权码：<input type="password" name="smtp_pass" value="{{ config.get('smtp_pass','') }}"></label>
+      <h2>邮件规则与目标</h2>
+      <label>转发到邮箱：<input type="email" name="forward_email" value="{{ config.get('forward_email','') }}"></label>
+      <label>发件人筛选（逗号分隔）：<input type="text" name="senders" placeholder="例如: sender1@example.com,sender2@163.com" value="{{ config.get('senders','') }}"></label>
+      <h2>DeepSeek 配置</h2>
+      <label>DeepSeek Token：<input type="text" name="deepseek_token" value="{{ config.get('deepseek_token','') }}"></label>
+      <button type="submit">保存配置</button>
+    </form>
+  </main>
+  <footer>
+    <p>&copy; 2025 邮件汇总系统</p>
+  </footer>
+</body>
+</html>

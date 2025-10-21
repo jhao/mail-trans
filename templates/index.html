@@ -1,0 +1,71 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>邮件汇总系统 - 首页</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+  <header>
+    <h1>邮件汇总系统</h1>
+    <nav>
+      <a href="{{ url_for('index') }}">首页</a> |
+      <a href="{{ url_for('config_page') }}">配置</a> |
+      <a href="{{ url_for('logs_page') }}">日志</a>
+    </nav>
+  </header>
+  <main>
+    {% with messages = get_flashed_messages() %}
+      {% if messages %}
+        <ul class="flash-messages">
+        {% for message in messages %}
+          <li>{{ message }}</li>
+        {% endfor %}
+        </ul>
+      {% endif %}
+    {% endwith %}
+    <section>
+      <h2>最近运行</h2>
+      {% if last_run %}
+        <p><strong>时间：</strong>{{ last_run.time }}</p>
+        <p><strong>结果：</strong>{% if last_run.success %}成功{% else %}失败{% endif %}</p>
+        <p><strong>详情：</strong>{{ last_run.message }}</p>
+      {% else %}
+        <p>暂时没有运行记录。</p>
+      {% endif %}
+      <form action="{{ url_for('run_now') }}" method="post">
+        <button type="submit">立即执行任务</button>
+      </form>
+    </section>
+    <section>
+      <h2>最近日志</h2>
+      {% if logs %}
+        <table class="log-table">
+          <thead>
+            <tr>
+              <th>时间</th>
+              <th>状态</th>
+              <th>信息</th>
+            </tr>
+          </thead>
+          <tbody>
+          {% for log in logs|reverse %}
+            <tr>
+              <td>{{ log.time }}</td>
+              <td>{% if log.success %}成功{% else %}失败{% endif %}</td>
+              <td>{{ log.message }}</td>
+            </tr>
+          {% endfor %}
+          </tbody>
+        </table>
+      {% else %}
+        <p>暂无日志记录。</p>
+      {% endif %}
+    </section>
+  </main>
+  <footer>
+    <p>&copy; 2025 邮件汇总系统</p>
+  </footer>
+</body>
+</html>
