@@ -164,7 +164,9 @@ def process_emails():
         # 连接 IMAP
         mail = imaplib.IMAP4_SSL(imap_host, imap_port)
         mail.login(imap_user, imap_pass)
-        mail.select("INBOX")
+        status, _ = mail.select("INBOX")
+        if status != 'OK':
+            raise Exception('IMAP 选择邮箱失败')
         # 搜索未读邮件
         status, messages = mail.search(None, 'UNSEEN')
         if status != 'OK':
@@ -354,7 +356,7 @@ def start_scheduler():
     scheduler.start()
 
 
-def get_runtime_port(default: int = 5000) -> int:
+def get_runtime_port(default: int = 6006) -> int:
     """返回浏览器可访问的安全端口。"""
     env_port = os.environ.get('APP_PORT') or os.environ.get('PORT')
     port = default
