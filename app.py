@@ -2,6 +2,7 @@ import os
 import json
 import logging
 import re
+import base64
 from datetime import datetime
 from flask import Flask, render_template, request, redirect, url_for, flash
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -52,6 +53,84 @@ def _send_imap_id(mail: imaplib.IMAP4) -> None:
         logging.debug("发送 IMAP ID 指令失败：%s", exc)
 
 
+def _imap_encode_utf7(mailbox: str) -> str:
+    """Encode mailbox names using IMAP modified UTF-7 with graceful fallback."""
+    try:
+        encoder = getattr(imaplib.IMAP4, '_encode_utf7')
+    except AttributeError:
+        encoder = None
+    if callable(encoder):
+        try:
+            return encoder(mailbox)
+        except Exception:
+            logging.debug("内置 UTF-7 编码失败，使用自定义实现。", exc_info=True)
+    # 自定义实现基于 RFC 2060 Modified UTF-7 规则
+    pieces: list[str] = []
+    buffer: list[str] = []
+
+    def _flush_buffer() -> None:
+        if not buffer:
+            return
+        chunk = ''.join(buffer)
+        encoded = base64.b64encode(chunk.encode('utf-16-be')).decode('ascii').rstrip('=')
+        pieces.append(f'&{encoded}-')
+        buffer.clear()
+
+    for char in mailbox:
+        code_point = ord(char)
+        if 0x20 <= code_point <= 0x7e and char != '&':
+            _flush_buffer()
+            pieces.append(char)
+        elif char == '&':
+            _flush_buffer()
+            pieces.append('&-')
+        else:
+            buffer.append(char)
+
+    _flush_buffer()
+    return ''.join(pieces)
+
+
+def _imap_decode_utf7(mailbox: str) -> str:
+    """Decode mailbox names encoded with IMAP modified UTF-7."""
+    try:
+        decoder = getattr(imaplib.IMAP4, '_decode_utf7')
+    except AttributeError:
+        decoder = None
+    if callable(decoder):
+        try:
+            return decoder(mailbox)
+        except Exception:
+            logging.debug("内置 UTF-7 解码失败，使用自定义实现。", exc_info=True)
+
+    result: list[str] = []
+    i = 0
+    length = len(mailbox)
+    while i < length:
+        char = mailbox[i]
+        if char == '&':
+            j = i + 1
+            while j < length and mailbox[j] != '-':
+                j += 1
+            if j == i + 1:
+                result.append('&')
+            else:
+                chunk = mailbox[i + 1:j]
+                padding = (-len(chunk)) % 4
+                chunk += '=' * padding
+                try:
+                    decoded = base64.b64decode(chunk)
+                    result.append(decoded.decode('utf-16-be'))
+                except Exception:
+                    logging.debug("自定义 UTF-7 解码失败，保留原始片段: %s", chunk, exc_info=True)
+                    result.append('&' + mailbox[i + 1:j] + '-')
+            i = j
+        else:
+            result.append(char)
+        i += 1
+    return ''.join(result)
+
+
 def _decode_mailbox_name(raw: bytes) -> str | None:
     """从 IMAP LIST 返回的原始行中提取并解码邮箱名称。"""
     if not raw:
@@ -80,7 +159,7 @@ def _decode_mailbox_name(raw: bytes) -> str | None:
         try:
             ascii_source = mailbox_bytes.decode('ascii', errors='ignore')
             logging.debug("imap4-utf-7 解码失败，尝试通过 ASCII -> _decode_utf7: %s", ascii_source)
-            decoded_mailbox = imaplib.IMAP4._decode_utf7(ascii_source)
+            decoded_mailbox = _imap_decode_utf7(ascii_source)
             logging.debug("使用 _decode_utf7 解码成功: %s", decoded_mailbox)
             return decoded_mailbox
         except Exception:
@@ -263,7 +342,7 @@ def process_emails():
         target_mailbox = config.get('imap_mailbox') or 'INBOX'
         encoded_mailbox = target_mailbox
         try:
-            encoded_mailbox = imaplib.IMAP4._encode_utf7(target_mailbox)
+            encoded_mailbox = _imap_encode_utf7(target_mailbox)
             if encoded_mailbox != target_mailbox:
                 logging.info("IMAP 邮箱名称 UTF-7 编码: %s -> %s", target_mailbox, encoded_mailbox)
             else:
@@ -296,7 +375,7 @@ def process_emails():
                 if fallback_mailbox and fallback_mailbox != target_mailbox:
                     logging.info("使用备用收件箱名称 %s 重试选择。", fallback_mailbox)
                     try:
-                        encoded_mailbox = imaplib.IMAP4._encode_utf7(fallback_mailbox)
+                        encoded_mailbox = _imap_encode_utf7(fallback_mailbox)
                     except Exception:
                         encoded_mailbox = fallback_mailbox
                         logging.debug("备用邮箱 %s 使用原值进行选择。", fallback_mailbox)
