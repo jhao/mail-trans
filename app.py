@@ -31,6 +31,14 @@ app.secret_key = 'change-me-secret-key'
 CONFIG_FILE = os.path.join(os.path.dirname(__file__), 'config.json')
 LOG_FILE = os.path.join(os.path.dirname(__file__), 'logs.json')
 
+UNSAFE_PORTS = {
+    1, 7, 9, 11, 13, 15, 17, 19, 20, 21, 22, 23, 25, 37, 42, 43, 53, 77, 79,
+    87, 95, 101, 102, 103, 104, 109, 110, 111, 113, 115, 117, 119, 123, 135,
+    139, 143, 179, 389, 427, 465, 512, 513, 514, 515, 526, 530, 531, 532, 540,
+    548, 556, 563, 587, 601, 636, 993, 995, 2049, 3659, 4045, 6000, 6665, 6666,
+    6667, 6668, 6669, 6697, 10080,
+}
+
 
 def load_config():
     """读取配置文件，不存在则返回空字典"""
@@ -346,8 +354,26 @@ def start_scheduler():
     scheduler.start()
 
 
+def get_runtime_port(default: int = 5000) -> int:
+    """返回浏览器可访问的安全端口。"""
+    env_port = os.environ.get('APP_PORT') or os.environ.get('PORT')
+    port = default
+    if env_port:
+        try:
+            port = int(env_port)
+        except ValueError:
+            logging.warning("无效的端口号 %s，使用默认端口 %s。", env_port, default)
+            port = default
+    if port in UNSAFE_PORTS:
+        logging.warning("端口 %s 在浏览器中被标记为不安全，自动切换到 %s。", port, default)
+        port = default
+    return port
+
+
 if __name__ == '__main__':
     # 开启定时任务
     start_scheduler()
     # 启动 Flask
-    app.run(host='0.0.0.0', port=5000)
+    host = os.environ.get('APP_HOST', '0.0.0.0')
+    port = get_runtime_port()
+    app.run(host=host, port=port)
