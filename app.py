@@ -1,6 +1,7 @@
 import os
 import json
 import logging
+import re
 from datetime import datetime
 from flask import Flask, render_template, request, redirect, url_for, flash
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -40,6 +41,66 @@ UNSAFE_PORTS = {
     548, 556, 563, 587, 601, 636, 993, 995, 2049, 3659, 4045, 6000, 6665, 6666,
     6667, 6668, 6669, 6697, 10080,
 }
+
+
+def _send_imap_id(mail: imaplib.IMAP4) -> None:
+    """向 IMAP 服务器发送 ID 指令以降低 Unsafe Login 触发概率。"""
+    try:
+        mail._simple_command('ID', '("name" "python-imaplib" "version" "3.x" "vendor" "python")')
+        mail._untagged_response('ID')
+    except Exception as exc:
+        logging.debug("发送 IMAP ID 指令失败：%s", exc)
+
+
+def _decode_mailbox_name(raw: bytes) -> str | None:
+    """从 IMAP LIST 返回的原始行中提取并解码邮箱名称。"""
+    if not raw:
+        return None
+    mailbox_bytes = None
+    match = re.search(br' "/" (.+)$', raw)
+    if match:
+        mailbox_bytes = match.group(1).strip()
+    if mailbox_bytes is None:
+        parts = raw.split()
+        mailbox_bytes = parts[-1].strip() if parts else b''
+    if mailbox_bytes.startswith(b'"') and mailbox_bytes.endswith(b'"'):
+        mailbox_bytes = mailbox_bytes[1:-1]
+    if not mailbox_bytes:
+        return None
+    try:
+        return mailbox_bytes.decode('imap4-utf-7')
+    except Exception:
+        try:
+            decoded_mailbox = imaplib.IMAP4._decode_utf7(mailbox_bytes.decode('ascii', errors='ignore'))
+            return decoded_mailbox
+        except Exception:
+            return mailbox_bytes.decode('utf-8', errors='ignore') or None
+
+
+def _list_imap_mailboxes(mail: imaplib.IMAP4) -> list[str]:
+    """列出并解码 IMAP 邮箱名称。"""
+    status, raw_mailboxes = mail.list()
+    if status != 'OK':
+        raise RuntimeError('获取邮箱列表失败')
+    mailboxes: list[str] = []
+    for raw in raw_mailboxes or []:
+        if not raw:
+            continue
+        logging.info("IMAP 邮箱列表原始响应: %r", raw)
+        mailbox = _decode_mailbox_name(raw)
+        if not mailbox:
+            continue
+        logging.info("IMAP 邮箱名称解析结果: %s", mailbox)
+        mailboxes.append(mailbox)
+    return mailboxes
+
+
+def _find_inbox_name(mailboxes: list[str]) -> str | None:
+    """从邮箱列表中寻找标准收件箱名称。"""
+    for mailbox in mailboxes:
+        if mailbox.upper() == 'INBOX' or mailbox == '收件箱':
+            return mailbox
+    return None
 
 
 def load_config():
@@ -131,45 +192,8 @@ def fetch_imap_mailboxes(host: str, port: int, username: str, password: str) -> 
     mail = imaplib.IMAP4_SSL(host, int(port))
     try:
         mail.login(username, password)
-        status, raw_mailboxes = mail.list()
-        if status != 'OK':
-            raise RuntimeError('获取邮箱列表失败')
-        mailboxes = []
-        for raw in raw_mailboxes or []:
-            if not raw:
-                continue
-            logging.info("IMAP 邮箱列表原始响应: %r", raw)
-            decoded = None
-            encoding_used = None
-            for encoding in ('utf-8', 'gb18030', 'latin-1'):
-                try:
-                    decoded = raw.decode(encoding)
-                    encoding_used = encoding
-                    break
-                except UnicodeDecodeError:
-                    continue
-            if decoded is None:
-                decoded = raw.decode('utf-8', errors='ignore')
-                encoding_used = 'utf-8 (ignore errors)'
-            logging.info("IMAP 邮箱列表解码结果（编码：%s）: %s", encoding_used, decoded)
-            # 典型格式：(\HasNoChildren) "/" "INBOX"
-            if '"' in decoded:
-                mailbox = decoded.split('"')[-2]
-            else:
-                parts = decoded.split(') ', 1)
-                mailbox = parts[-1] if len(parts) > 1 else decoded
-            mailbox = mailbox.strip()
-            if not mailbox:
-                continue
-            try:
-                decoded_mailbox = imaplib.IMAP4._decode_utf7(mailbox)
-                if decoded_mailbox != mailbox:
-                    logging.info("IMAP 邮箱名称 UTF-7 解码: %s -> %s", mailbox, decoded_mailbox)
-                mailbox = decoded_mailbox
-            except Exception:
-                logging.warning("IMAP 邮箱名称 UTF-7 解码失败，保留原值: %s", mailbox)
-            if mailbox:
-                mailboxes.append(mailbox)
+        _send_imap_id(mail)
+        mailboxes = _list_imap_mailboxes(mail)
         logging.info("IMAP 验证成功，可用邮箱列表：%s", ", ".join(mailboxes))
         return mailboxes
     finally:
@@ -219,6 +243,7 @@ def process_emails():
         # 连接 IMAP
         mail = imaplib.IMAP4_SSL(imap_host, imap_port)
         mail.login(imap_user, imap_pass)
+        _send_imap_id(mail)
         target_mailbox = config.get('imap_mailbox') or 'INBOX'
         encoded_mailbox = target_mailbox
         try:
@@ -229,14 +254,37 @@ def process_emails():
             logging.warning("IMAP 邮箱名称 UTF-7 编码失败，使用原值: %s", target_mailbox)
             encoded_mailbox = target_mailbox
         status, data = mail.select(encoded_mailbox)
+        detail = ''
         if status != 'OK':
-            detail = ''
             if data:
                 try:
                     detail = data[0].decode('utf-8', errors='ignore')
                 except Exception:
                     detail = str(data)
-            raise Exception(f"IMAP 选择邮箱失败：{target_mailbox}{(' - ' + detail) if detail else ''}")
+            lower_detail = detail.lower()
+            if 'unsafe login' in lower_detail:
+                logging.warning("选择邮箱 %s 时触发 Unsafe Login，尝试获取邮箱列表后重试。", target_mailbox)
+                try:
+                    available_mailboxes = _list_imap_mailboxes(mail)
+                except Exception as exc:
+                    logging.warning("获取邮箱列表用于重试失败：%s", exc)
+                    available_mailboxes = []
+                fallback_mailbox = _find_inbox_name(available_mailboxes)
+                if fallback_mailbox and fallback_mailbox != target_mailbox:
+                    logging.info("使用备用收件箱名称 %s 重试选择。", fallback_mailbox)
+                    try:
+                        encoded_mailbox = imaplib.IMAP4._encode_utf7(fallback_mailbox)
+                    except Exception:
+                        encoded_mailbox = fallback_mailbox
+                    retry_status, retry_data = mail.select(encoded_mailbox)
+                    if retry_status == 'OK':
+                        logging.info("备用邮箱 %s 选择成功。", fallback_mailbox)
+                        status = retry_status
+                        data = retry_data
+                        target_mailbox = fallback_mailbox
+                        detail = ''
+            if status != 'OK':
+                raise Exception(f"IMAP 选择邮箱失败：{target_mailbox}{(' - ' + detail) if detail else ''}")
         # 搜索未读邮件
         status, messages = mail.search(None, 'UNSEEN')
         if status != 'OK':
