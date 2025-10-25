@@ -34,12 +34,13 @@
       <label>读取邮箱文件夹：
         {% if mailboxes %}
           <select name="imap_mailbox">
+            <option value="" disabled {% if not config.get('imap_mailbox') %}selected{% endif %}>请选择邮箱文件夹</option>
             {% for mailbox in mailboxes %}
-              <option value="{{ mailbox }}" {% if mailbox == config.get('imap_mailbox','INBOX') %}selected{% endif %}>{{ mailbox }}</option>
+              <option value="{{ mailbox }}" {% if mailbox == config.get('imap_mailbox') %}selected{% endif %}>{{ mailbox }}</option>
             {% endfor %}
           </select>
         {% else %}
-          <input type="text" name="imap_mailbox" value="{{ config.get('imap_mailbox','INBOX') }}">
+          <input type="text" name="imap_mailbox" value="{{ config.get('imap_mailbox','') }}">
           <small class="hint">尚未获取邮箱列表，可先填写名称或点击下方按钮验证后选择。</small>
         {% endif %}
       </label>
@@ -62,5 +63,14 @@
   <footer>
     <p>&copy; 2025 邮件汇总系统</p>
   </footer>
+  {% if fetched_mailboxes %}
+  <script>
+    window.addEventListener('DOMContentLoaded', function () {
+      const mailboxes = {{ fetched_mailboxes | tojson }};
+      const message = mailboxes.length ? mailboxes.join('\n') : '未获取到任何邮箱文件夹。';
+      alert('成功获取邮箱文件夹列表：\n' + message);
+    });
+  </script>
+  {% endif %}
 </body>
 </html>
