@@ -33,6 +33,7 @@ nav a:hover {
 
 main {
   padding: 20px;
+  padding-bottom: 120px;
 }
 
 footer {
@@ -44,6 +45,12 @@ footer {
   bottom: 0;
   left: 0;
   width: 100%;
+}
+
+.config-form .form-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
 }
 
 /* 日志表格 */
