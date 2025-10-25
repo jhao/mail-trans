@@ -28,6 +28,8 @@ import requests
 app = Flask(__name__)
 app.secret_key = 'change-me-secret-key'
 
+logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
+
 CONFIG_FILE = os.path.join(os.path.dirname(__file__), 'config.json')
 LOG_FILE = os.path.join(os.path.dirname(__file__), 'logs.json')
 
@@ -136,7 +138,20 @@ def fetch_imap_mailboxes(host: str, port: int, username: str, password: str) -> 
         for raw in raw_mailboxes or []:
             if not raw:
                 continue
-            decoded = raw.decode('utf-8', errors='ignore')
+            logging.info("IMAP 邮箱列表原始响应: %r", raw)
+            decoded = None
+            encoding_used = None
+            for encoding in ('utf-8', 'gb18030', 'latin-1'):
+                try:
+                    decoded = raw.decode(encoding)
+                    encoding_used = encoding
+                    break
+                except UnicodeDecodeError:
+                    continue
+            if decoded is None:
+                decoded = raw.decode('utf-8', errors='ignore')
+                encoding_used = 'utf-8 (ignore errors)'
+            logging.info("IMAP 邮箱列表解码结果（编码：%s）: %s", encoding_used, decoded)
             # 典型格式：(\HasNoChildren) "/" "INBOX"
             if '"' in decoded:
                 mailbox = decoded.split('"')[-2]
@@ -147,10 +162,12 @@ def fetch_imap_mailboxes(host: str, port: int, username: str, password: str) -> 
             if not mailbox:
                 continue
             try:
-                mailbox = imaplib.IMAP4._decode_utf7(mailbox)
+                decoded_mailbox = imaplib.IMAP4._decode_utf7(mailbox)
+                if decoded_mailbox != mailbox:
+                    logging.info("IMAP 邮箱名称 UTF-7 解码: %s -> %s", mailbox, decoded_mailbox)
+                mailbox = decoded_mailbox
             except Exception:
-                # 如果解码失败则保留原值，避免因异常导致列表中断
-                pass
+                logging.warning("IMAP 邮箱名称 UTF-7 解码失败，保留原值: %s", mailbox)
             if mailbox:
                 mailboxes.append(mailbox)
         return mailboxes
