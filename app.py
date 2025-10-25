@@ -144,6 +144,13 @@ def fetch_imap_mailboxes(host: str, port: int, username: str, password: str) -> 
                 parts = decoded.split(') ', 1)
                 mailbox = parts[-1] if len(parts) > 1 else decoded
             mailbox = mailbox.strip()
+            if not mailbox:
+                continue
+            try:
+                mailbox = imaplib.IMAP4._decode_utf7(mailbox)
+            except Exception:
+                # 如果解码失败则保留原值，避免因异常导致列表中断
+                pass
             if mailbox:
                 mailboxes.append(mailbox)
         return mailboxes
