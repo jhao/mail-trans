@@ -55,26 +55,38 @@ def _send_imap_id(mail: imaplib.IMAP4) -> None:
 def _decode_mailbox_name(raw: bytes) -> str | None:
     """从 IMAP LIST 返回的原始行中提取并解码邮箱名称。"""
     if not raw:
+        logging.debug("收到空的 IMAP 邮箱原始数据，返回 None。")
         return None
     mailbox_bytes = None
     match = re.search(br' "/" (.+)$', raw)
     if match:
+        logging.debug("通过正则匹配提取邮箱名称: %s", match.group(1))
         mailbox_bytes = match.group(1).strip()
     if mailbox_bytes is None:
         parts = raw.split()
         mailbox_bytes = parts[-1].strip() if parts else b''
+        logging.debug("通过分割方式提取邮箱名称: %s", mailbox_bytes)
     if mailbox_bytes.startswith(b'"') and mailbox_bytes.endswith(b'"'):
+        logging.debug("去除邮箱名称外层引号。")
         mailbox_bytes = mailbox_bytes[1:-1]
     if not mailbox_bytes:
+        logging.debug("邮箱名称字节串为空，返回 None。")
         return None
     try:
-        return mailbox_bytes.decode('imap4-utf-7')
+        decoded = mailbox_bytes.decode('imap4-utf-7')
+        logging.debug("使用 imap4-utf-7 解码邮箱名称成功: %s", decoded)
+        return decoded
     except Exception:
         try:
-            decoded_mailbox = imaplib.IMAP4._decode_utf7(mailbox_bytes.decode('ascii', errors='ignore'))
+            ascii_source = mailbox_bytes.decode('ascii', errors='ignore')
+            logging.debug("imap4-utf-7 解码失败，尝试通过 ASCII -> _decode_utf7: %s", ascii_source)
+            decoded_mailbox = imaplib.IMAP4._decode_utf7(ascii_source)
+            logging.debug("使用 _decode_utf7 解码成功: %s", decoded_mailbox)
             return decoded_mailbox
         except Exception:
-            return mailbox_bytes.decode('utf-8', errors='ignore') or None
+            fallback = mailbox_bytes.decode('utf-8', errors='ignore') or None
+            logging.debug("所有专用解码失败，退回 UTF-8 忽略错误: %s", fallback)
+            return fallback
 
 
 def _list_imap_mailboxes(mail: imaplib.IMAP4) -> list[str]:
@@ -99,7 +111,9 @@ def _find_inbox_name(mailboxes: list[str]) -> str | None:
     """从邮箱列表中寻找标准收件箱名称。"""
     for mailbox in mailboxes:
         if mailbox.upper() == 'INBOX' or mailbox == '收件箱':
+            logging.debug("匹配到标准收件箱名称: %s", mailbox)
             return mailbox
+    logging.debug("邮箱列表中未找到标准收件箱名称。")
     return None
 
 
@@ -219,10 +233,12 @@ def process_emails():
     ]
     missing_fields = [field for field in required_fields if not config.get(field)]
     if missing_fields:
+        logging.error("任务配置缺失字段：%s", ', '.join(missing_fields))
         log_entry['message'] = f"配置项缺失：{', '.join(missing_fields)}。请在配置页面完善。"
         logs.append(log_entry)
         save_logs(logs)
         return
+    logging.debug("所有必要配置均已填写。")
 
     # 解析配置
     imap_host = config.get('imap_host')
@@ -250,10 +266,14 @@ def process_emails():
             encoded_mailbox = imaplib.IMAP4._encode_utf7(target_mailbox)
             if encoded_mailbox != target_mailbox:
                 logging.info("IMAP 邮箱名称 UTF-7 编码: %s -> %s", target_mailbox, encoded_mailbox)
-        except Exception:
-            logging.warning("IMAP 邮箱名称 UTF-7 编码失败，使用原值: %s", target_mailbox)
+            else:
+                logging.debug("IMAP 邮箱名称无需 UTF-7 编码: %s", target_mailbox)
+        except Exception as exc:
+            logging.warning("IMAP 邮箱名称 UTF-7 编码失败，使用原值: %s，错误: %s", target_mailbox, exc)
             encoded_mailbox = target_mailbox
         status, data = mail.select(encoded_mailbox)
+        if status == 'OK':
+            logging.info("IMAP 邮箱 %s 选择成功。", target_mailbox)
         detail = ''
         if status != 'OK':
             if data:
@@ -261,6 +281,7 @@ def process_emails():
                     detail = data[0].decode('utf-8', errors='ignore')
                 except Exception:
                     detail = str(data)
+                logging.debug("IMAP 选择失败的原始响应: %s", detail)
             lower_detail = detail.lower()
             if 'unsafe login' in lower_detail:
                 logging.warning("选择邮箱 %s 时触发 Unsafe Login，尝试获取邮箱列表后重试。", target_mailbox)
@@ -269,6 +290,8 @@ def process_emails():
                 except Exception as exc:
                     logging.warning("获取邮箱列表用于重试失败：%s", exc)
                     available_mailboxes = []
+                else:
+                    logging.info("成功获取 %d 个邮箱用于重试。", len(available_mailboxes))
                 fallback_mailbox = _find_inbox_name(available_mailboxes)
                 if fallback_mailbox and fallback_mailbox != target_mailbox:
                     logging.info("使用备用收件箱名称 %s 重试选择。", fallback_mailbox)
@@ -276,6 +299,7 @@ def process_emails():
                         encoded_mailbox = imaplib.IMAP4._encode_utf7(fallback_mailbox)
                     except Exception:
                         encoded_mailbox = fallback_mailbox
+                        logging.debug("备用邮箱 %s 使用原值进行选择。", fallback_mailbox)
                     retry_status, retry_data = mail.select(encoded_mailbox)
                     if retry_status == 'OK':
                         logging.info("备用邮箱 %s 选择成功。", fallback_mailbox)
@@ -283,7 +307,21 @@ def process_emails():
                         data = retry_data
                         target_mailbox = fallback_mailbox
                         detail = ''
+                    else:
+                        retry_detail = ''
+                        if retry_data:
+                            try:
+                                retry_detail = retry_data[0].decode('utf-8', errors='ignore')
+                            except Exception:
+                                retry_detail = str(retry_data)
+                        logging.warning("备用邮箱 %s 选择失败: %s", fallback_mailbox, retry_detail)
+                elif fallback_mailbox == target_mailbox:
+                    logging.info("获取到的备用邮箱与当前目标一致：%s，跳过重试。", fallback_mailbox)
+                else:
+                    logging.warning("未找到可用的备用收件箱用于重试。")
             if status != 'OK':
+                if 'unsafe login' not in lower_detail:
+                    logging.error("IMAP 选择邮箱 %s 失败，原因: %s", target_mailbox, detail or '未知')
                 raise Exception(f"IMAP 选择邮箱失败：{target_mailbox}{(' - ' + detail) if detail else ''}")
         # 搜索未读邮件
         status, messages = mail.search(None, 'UNSEEN')
@@ -308,17 +346,21 @@ def process_emails():
             # 发件人筛选
             matched = False
             if sender_list:
+                logging.debug("启用发件人过滤规则：%s", ', '.join(sender_list))
                 for s in sender_list:
                     if s.lower() in from_.lower():
                         matched = True
                         break
             else:
+                logging.debug("未配置发件人过滤，全部未读邮件均处理。")
                 matched = True
             if not matched:
+                logging.debug("邮件 %s 不满足发件人过滤条件，跳过。", subject)
                 continue
             # 提取正文
             body = ""
             if msg.is_multipart():
+                logging.debug("邮件 %s 为多部分结构，开始解析。", subject)
                 # 优先取纯文本部分
                 for part in msg.walk():
                     content_type = part.get_content_type()
@@ -332,6 +374,7 @@ def process_emails():
                         break
                 # 如果没有纯文本，再尝试读取 html
                 if not body:
+                    logging.debug("邮件 %s 未找到纯文本部分，尝试解析 HTML。", subject)
                     for part in msg.walk():
                         content_type = part.get_content_type()
                         content_disposition = str(part.get("Content-Disposition"))
@@ -344,6 +387,7 @@ def process_emails():
                             break
             else:
                 content_type = msg.get_content_type()
+                logging.debug("邮件 %s 为单部分，内容类型 %s。", subject, content_type)
                 if content_type in ["text/plain", "text/html"]:
                     try:
                         charset = msg.get_content_charset() or 'utf-8'
@@ -351,6 +395,7 @@ def process_emails():
                     except Exception:
                         body = msg.get_payload(decode=True).decode('utf-8', errors='ignore')
             if not body:
+                logging.debug("邮件 %s 未能提取正文，跳过。", subject)
                 continue
             # 调用 DeepSeek 翻译
             chinese = deepseek_translate(body, deepseek_token)
