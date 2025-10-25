@@ -124,6 +124,36 @@ def deepseek_summarize(text: str, token: str) -> str:
     return text[:200]
 
 
+def fetch_imap_mailboxes(host: str, port: int, username: str, password: str) -> list[str]:
+    """验证 IMAP 连接并返回邮箱文件夹名称列表。"""
+    mail = imaplib.IMAP4_SSL(host, int(port))
+    try:
+        mail.login(username, password)
+        status, raw_mailboxes = mail.list()
+        if status != 'OK':
+            raise RuntimeError('获取邮箱列表失败')
+        mailboxes = []
+        for raw in raw_mailboxes or []:
+            if not raw:
+                continue
+            decoded = raw.decode('utf-8', errors='ignore')
+            # 典型格式：(\HasNoChildren) "/" "INBOX"
+            if '"' in decoded:
+                mailbox = decoded.split('"')[-2]
+            else:
+                parts = decoded.split(') ', 1)
+                mailbox = parts[-1] if len(parts) > 1 else decoded
+            mailbox = mailbox.strip()
+            if mailbox:
+                mailboxes.append(mailbox)
+        return mailboxes
+    finally:
+        try:
+            mail.logout()
+        except Exception:
+            pass
+
+
 def process_emails():
     """核心任务：读取邮件、翻译、汇总并转发"""
     config = load_config()
@@ -164,9 +194,10 @@ def process_emails():
         # 连接 IMAP
         mail = imaplib.IMAP4_SSL(imap_host, imap_port)
         mail.login(imap_user, imap_pass)
-        status, _ = mail.select("INBOX")
+        target_mailbox = config.get('imap_mailbox', 'INBOX') or 'INBOX'
+        status, _ = mail.select(target_mailbox)
         if status != 'OK':
-            raise Exception('IMAP 选择邮箱失败')
+            raise Exception(f'IMAP 选择邮箱失败：{target_mailbox}')
         # 搜索未读邮件
         status, messages = mail.search(None, 'UNSEEN')
         if status != 'OK':
@@ -323,12 +354,15 @@ def run_now():
 def config_page():
     """配置页面：显示或保存配置"""
     config = load_config()
+    mailboxes = config.get('available_mailboxes', [])
     if request.method == 'POST':
+        action = request.form.get('action', 'save')
         # 保存用户提交的配置
         config['imap_host'] = request.form.get('imap_host', '').strip()
         config['imap_port'] = request.form.get('imap_port', '').strip()
         config['imap_user'] = request.form.get('imap_user', '').strip()
         config['imap_pass'] = request.form.get('imap_pass', '').strip()
+        config['imap_mailbox'] = request.form.get('imap_mailbox', '').strip() or 'INBOX'
         config['smtp_host'] = request.form.get('smtp_host', '').strip()
         config['smtp_port'] = request.form.get('smtp_port', '').strip()
         config['smtp_user'] = request.form.get('smtp_user', '').strip()
@@ -336,10 +370,29 @@ def config_page():
         config['forward_email'] = request.form.get('forward_email', '').strip()
         config['senders'] = request.form.get('senders', '').strip()
         config['deepseek_token'] = request.form.get('deepseek_token', '').strip()
+
+        if action == 'fetch_mailboxes':
+            try:
+                mailboxes = fetch_imap_mailboxes(
+                    config['imap_host'],
+                    int(config['imap_port'] or 993),
+                    config['imap_user'],
+                    config['imap_pass'],
+                )
+                config['available_mailboxes'] = mailboxes
+                if mailboxes and config['imap_mailbox'] not in mailboxes:
+                    config['imap_mailbox'] = mailboxes[0]
+                save_config(config)
+                flash("邮箱验证成功，已获取可用列表。")
+            except Exception as exc:
+                flash(f"获取邮箱列表失败：{exc}")
+            return render_template('config.html', config=config, mailboxes=mailboxes)
+
+        config['available_mailboxes'] = mailboxes
         save_config(config)
         flash("配置已保存。")
         return redirect(url_for('config_page'))
-    return render_template('config.html', config=config)
+    return render_template('config.html', config=config, mailboxes=mailboxes)
 
 
 @app.route('/logs')

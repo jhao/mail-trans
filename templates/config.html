@@ -31,6 +31,18 @@
       <label>IMAP 端口：<input type="text" name="imap_port" value="{{ config.get('imap_port','993') }}"></label>
       <label>邮箱账号：<input type="text" name="imap_user" value="{{ config.get('imap_user','') }}"></label>
       <label>邮箱密码/授权码：<input type="password" name="imap_pass" value="{{ config.get('imap_pass','') }}"></label>
+      <label>读取邮箱文件夹：
+        {% if mailboxes %}
+          <select name="imap_mailbox">
+            {% for mailbox in mailboxes %}
+              <option value="{{ mailbox }}" {% if mailbox == config.get('imap_mailbox','INBOX') %}selected{% endif %}>{{ mailbox }}</option>
+            {% endfor %}
+          </select>
+        {% else %}
+          <input type="text" name="imap_mailbox" value="{{ config.get('imap_mailbox','INBOX') }}">
+          <small class="hint">尚未获取邮箱列表，可先填写名称或点击下方按钮验证后选择。</small>
+        {% endif %}
+      </label>
       <h2>SMTP 发件配置</h2>
       <label>SMTP 服务器地址：<input type="text" name="smtp_host" value="{{ config.get('smtp_host','') }}"></label>
       <label>SMTP 端口：<input type="text" name="smtp_port" value="{{ config.get('smtp_port','465') }}"></label>
@@ -41,7 +53,10 @@
       <label>发件人筛选（逗号分隔）：<input type="text" name="senders" placeholder="例如: sender1@example.com,sender2@163.com" value="{{ config.get('senders','') }}"></label>
       <h2>DeepSeek 配置</h2>
       <label>DeepSeek Token：<input type="text" name="deepseek_token" value="{{ config.get('deepseek_token','') }}"></label>
-      <button type="submit">保存配置</button>
+      <div class="form-actions">
+        <button type="submit" name="action" value="save">保存配置</button>
+        <button type="submit" name="action" value="fetch_mailboxes">验证并获取邮箱列表</button>
+      </div>
     </form>
   </main>
   <footer>
