@@ -35,6 +35,13 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(mess
 CONFIG_FILE = os.path.join(os.path.dirname(__file__), 'config.json')
 LOG_FILE = os.path.join(os.path.dirname(__file__), 'logs.json')
 
+DEFAULT_IMAP_ID = {
+    'name': 'Apple Mail',
+    'version': '16.0',
+    'vendor': 'Apple Inc.',
+    'support-url': 'https://support.apple.com/mail',
+}
+
 UNSAFE_PORTS = {
     1, 7, 9, 11, 13, 15, 17, 19, 20, 21, 22, 23, 25, 37, 42, 43, 53, 77, 79,
     87, 95, 101, 102, 103, 104, 109, 110, 111, 113, 115, 117, 119, 123, 135,
@@ -48,23 +55,27 @@ def _build_imap_id_params(config: dict | None = None) -> dict[str, str]:
     """根据配置构建 IMAP ID 指令参数。"""
 
     config = config or {}
-    mapping = {
-        'name': config.get('imap_id_name'),
-        'version': config.get('imap_id_version'),
-        'vendor': config.get('imap_id_vendor'),
-        'support-email': config.get('imap_id_support_email') or config.get('forward_email'),
+    
+    def _resolve_value(config_key: str, default: str) -> str:
+        value = config.get(config_key)
+        if isinstance(value, str):
+            value = value.strip()
+            if value:
+                return value
+        return default
+
+    params: dict[str, str] = {
+        'name': _resolve_value('imap_id_name', DEFAULT_IMAP_ID['name']),
+        'version': _resolve_value('imap_id_version', DEFAULT_IMAP_ID['version']),
+        'vendor': _resolve_value('imap_id_vendor', DEFAULT_IMAP_ID['vendor']),
+        'support-url': _resolve_value('imap_id_support_url', DEFAULT_IMAP_ID['support-url']),
     }
 
-    params = {k: str(v).strip() for k, v in mapping.items() if isinstance(v, str) and v.strip()}
+    support_email = config.get('imap_id_support_email') or config.get('forward_email')
+    if isinstance(support_email, str) and support_email.strip():
+        params['support-email'] = support_email.strip()
 
-    if not params:
-        params = {
-            'name': 'mail-trans-client',
-            'version': '1.0.0',
-            'vendor': 'mail-trans',
-        }
-
-    return params
+    return {k: v for k, v in params.items() if isinstance(v, str) and v.strip()}
 
 
 def _send_imap_id(mail: imaplib.IMAP4, id_params: dict[str, str] | None = None) -> None:
@@ -626,6 +637,7 @@ def config_page():
         config['imap_id_name'] = request.form.get('imap_id_name', '').strip()
         config['imap_id_version'] = request.form.get('imap_id_version', '').strip()
         config['imap_id_vendor'] = request.form.get('imap_id_vendor', '').strip()
+        config['imap_id_support_url'] = request.form.get('imap_id_support_url', '').strip()
         config['imap_id_support_email'] = request.form.get('imap_id_support_email', '').strip()
         config['smtp_host'] = request.form.get('smtp_host', '').strip()
         config['smtp_port'] = request.form.get('smtp_port', '').strip()
@@ -652,13 +664,25 @@ def config_page():
                 flash("邮箱验证成功，已获取可用列表。")
             except Exception as exc:
                 flash(f"获取邮箱列表失败：{exc}")
-            return render_template('config.html', config=config, mailboxes=mailboxes, fetched_mailboxes=mailboxes)
+            return render_template(
+                'config.html',
+                config=config,
+                mailboxes=mailboxes,
+                fetched_mailboxes=mailboxes,
+                default_imap_id=DEFAULT_IMAP_ID,
+            )
 
         config['available_mailboxes'] = mailboxes
         save_config(config)
         flash("配置已保存。")
         return redirect(url_for('config_page'))
-    return render_template('config.html', config=config, mailboxes=mailboxes, fetched_mailboxes=None)
+    return render_template(
+        'config.html',
+        config=config,
+        mailboxes=mailboxes,
+        fetched_mailboxes=None,
+        default_imap_id=DEFAULT_IMAP_ID,
+    )
 
 
 @app.route('/logs')

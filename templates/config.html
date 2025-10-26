@@ -46,10 +46,14 @@
       </label>
       <h3>IMAP 客户端标识（ID 命令，可选）</h3>
       <p class="hint">当服务器要求提供 IMAP ID 信息时，可在此设置客户端名称、版本等标识以避免 Unsafe Login。</p>
-      <label>客户端名称（name）：<input type="text" name="imap_id_name" value="{{ config.get('imap_id_name','') }}"></label>
-      <label>客户端版本（version）：<input type="text" name="imap_id_version" value="{{ config.get('imap_id_version','') }}"></label>
-      <label>客户端供应商（vendor）：<input type="text" name="imap_id_vendor" value="{{ config.get('imap_id_vendor','') }}"></label>
+      <label>客户端名称（name）：<input type="text" name="imap_id_name" value="{{ config.get('imap_id_name') or default_imap_id['name'] }}"></label>
+      <label>客户端版本（version）：<input type="text" name="imap_id_version" value="{{ config.get('imap_id_version') or default_imap_id['version'] }}"></label>
+      <label>客户端供应商（vendor）：<input type="text" name="imap_id_vendor" value="{{ config.get('imap_id_vendor') or default_imap_id['vendor'] }}"></label>
+      <label>支持页面（support-url）：<input type="url" name="imap_id_support_url" value="{{ config.get('imap_id_support_url') or default_imap_id['support-url'] }}"></label>
       <label>支持邮箱（support-email）：<input type="email" name="imap_id_support_email" value="{{ config.get('imap_id_support_email','') }}"></label>
+      <div class="form-actions inline">
+        <button type="button" id="restore-imap-id-defaults">恢复默认值</button>
+      </div>
       <h2>SMTP 发件配置</h2>
       <label>SMTP 服务器地址：<input type="text" name="smtp_host" value="{{ config.get('smtp_host','') }}"></label>
       <label>SMTP 端口：<input type="text" name="smtp_port" value="{{ config.get('smtp_port','465') }}"></label>
@@ -69,6 +73,28 @@
   <footer>
     <p>&copy; 2025 邮件汇总系统</p>
   </footer>
+  <script>
+    window.addEventListener('DOMContentLoaded', function () {
+      const defaultImapId = {{ default_imap_id | tojson }};
+      const restoreButton = document.getElementById('restore-imap-id-defaults');
+      if (restoreButton) {
+        restoreButton.addEventListener('click', function () {
+          const mappings = {
+            name: 'imap_id_name',
+            version: 'imap_id_version',
+            vendor: 'imap_id_vendor',
+            'support-url': 'imap_id_support_url',
+          };
+          Object.entries(mappings).forEach(function ([key, inputName]) {
+            const input = document.querySelector(`input[name="${inputName}"]`);
+            if (input && defaultImapId[key]) {
+              input.value = defaultImapId[key];
+            }
+          });
+        });
+      }
+    });
+  </script>
   {% if fetched_mailboxes %}
   <script>
     window.addEventListener('DOMContentLoaded', function () {
