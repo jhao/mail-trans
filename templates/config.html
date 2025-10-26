@@ -44,6 +44,12 @@
           <small class="hint">尚未获取邮箱列表，可先填写名称或点击下方按钮验证后选择。</small>
         {% endif %}
       </label>
+      <h3>IMAP 客户端标识（ID 命令，可选）</h3>
+      <p class="hint">当服务器要求提供 IMAP ID 信息时，可在此设置客户端名称、版本等标识以避免 Unsafe Login。</p>
+      <label>客户端名称（name）：<input type="text" name="imap_id_name" value="{{ config.get('imap_id_name','') }}"></label>
+      <label>客户端版本（version）：<input type="text" name="imap_id_version" value="{{ config.get('imap_id_version','') }}"></label>
+      <label>客户端供应商（vendor）：<input type="text" name="imap_id_vendor" value="{{ config.get('imap_id_vendor','') }}"></label>
+      <label>支持邮箱（support-email）：<input type="email" name="imap_id_support_email" value="{{ config.get('imap_id_support_email','') }}"></label>
       <h2>SMTP 发件配置</h2>
       <label>SMTP 服务器地址：<input type="text" name="smtp_host" value="{{ config.get('smtp_host','') }}"></label>
       <label>SMTP 端口：<input type="text" name="smtp_port" value="{{ config.get('smtp_port','465') }}"></label>
