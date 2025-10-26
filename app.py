@@ -44,11 +44,53 @@ UNSAFE_PORTS = {
 }
 
 
-def _send_imap_id(mail: imaplib.IMAP4) -> None:
+def _build_imap_id_params(config: dict | None = None) -> dict[str, str]:
+    """根据配置构建 IMAP ID 指令参数。"""
+
+    config = config or {}
+    mapping = {
+        'name': config.get('imap_id_name'),
+        'version': config.get('imap_id_version'),
+        'vendor': config.get('imap_id_vendor'),
+        'support-email': config.get('imap_id_support_email') or config.get('forward_email'),
+    }
+
+    params = {k: str(v).strip() for k, v in mapping.items() if isinstance(v, str) and v.strip()}
+
+    if not params:
+        params = {
+            'name': 'mail-trans-client',
+            'version': '1.0.0',
+            'vendor': 'mail-trans',
+        }
+
+    return params
+
+
+def _send_imap_id(mail: imaplib.IMAP4, id_params: dict[str, str] | None = None) -> None:
     """向 IMAP 服务器发送 ID 指令以降低 Unsafe Login 触发概率。"""
+    if not id_params:
+        id_params = _build_imap_id_params()
+
+    pieces: list[str] = []
+    for key, value in id_params.items():
+        key = str(key).strip()
+        value = str(value).strip()
+        if not key or not value:
+            continue
+        safe_key = key.replace('"', '\\"')
+        safe_value = value.replace('"', '\\"')
+        pieces.append(f'"{safe_key}" "{safe_value}"')
+
+    if not pieces:
+        logging.debug("未生成有效的 IMAP ID 参数，跳过发送。")
+        return
+
+    payload = f'({" ".join(pieces)})'
     try:
-        mail._simple_command('ID', '("name" "python-imaplib" "version" "3.x" "vendor" "python")')
+        mail._simple_command('ID', payload)
         mail._untagged_response('ID')
+        logging.debug("已向 IMAP 服务器发送 ID 指令：%s", payload)
     except Exception as exc:
         logging.debug("发送 IMAP ID 指令失败：%s", exc)
 
@@ -280,12 +322,18 @@ def deepseek_summarize(text: str, token: str) -> str:
     return text[:200]
 
 
-def fetch_imap_mailboxes(host: str, port: int, username: str, password: str) -> list[str]:
+def fetch_imap_mailboxes(
+    host: str,
+    port: int,
+    username: str,
+    password: str,
+    id_params: dict[str, str] | None = None,
+) -> list[str]:
     """验证 IMAP 连接并返回邮箱文件夹名称列表。"""
     mail = imaplib.IMAP4_SSL(host, int(port))
     try:
         mail.login(username, password)
-        _send_imap_id(mail)
+        _send_imap_id(mail, id_params)
         mailboxes = _list_imap_mailboxes(mail)
         logging.info("IMAP 验证成功，可用邮箱列表：%s", ", ".join(mailboxes))
         return mailboxes
@@ -332,13 +380,14 @@ def process_emails():
     # 发件人过滤规则，允许多个发件人逗号分隔
     sender_list = [s.strip() for s in config.get('senders', '').split(',') if s.strip()]
     deepseek_token = config.get('deepseek_token')
+    imap_id_params = _build_imap_id_params(config)
 
     processed_emails = []
     try:
         # 连接 IMAP
         mail = imaplib.IMAP4_SSL(imap_host, imap_port)
         mail.login(imap_user, imap_pass)
-        _send_imap_id(mail)
+        _send_imap_id(mail, imap_id_params)
         target_mailbox = config.get('imap_mailbox') or 'INBOX'
         encoded_mailbox = target_mailbox
         try:
@@ -574,6 +623,10 @@ def config_page():
         config['imap_user'] = request.form.get('imap_user', '').strip()
         config['imap_pass'] = request.form.get('imap_pass', '').strip()
         config['imap_mailbox'] = request.form.get('imap_mailbox', '').strip()
+        config['imap_id_name'] = request.form.get('imap_id_name', '').strip()
+        config['imap_id_version'] = request.form.get('imap_id_version', '').strip()
+        config['imap_id_vendor'] = request.form.get('imap_id_vendor', '').strip()
+        config['imap_id_support_email'] = request.form.get('imap_id_support_email', '').strip()
         config['smtp_host'] = request.form.get('smtp_host', '').strip()
         config['smtp_port'] = request.form.get('smtp_port', '').strip()
         config['smtp_user'] = request.form.get('smtp_user', '').strip()
@@ -584,11 +637,13 @@ def config_page():
 
         if action == 'fetch_mailboxes':
             try:
+                id_params = _build_imap_id_params(config)
                 mailboxes = fetch_imap_mailboxes(
                     config['imap_host'],
                     int(config['imap_port'] or 993),
                     config['imap_user'],
                     config['imap_pass'],
+                    id_params,
                 )
                 config['available_mailboxes'] = mailboxes
                 if mailboxes and config['imap_mailbox'] not in mailboxes:
