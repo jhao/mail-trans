@@ -26,11 +26,23 @@
       {% endif %}
     {% endwith %}
     <form method="post" class="config-form">
+      {% set current_protocol = (config.get('mail_protocol') or 'imap').lower() %}
+      <h2>邮件接收协议</h2>
+      <label>选择协议：
+        <select name="mail_protocol">
+          <option value="imap" {% if current_protocol != 'pop3' %}selected{% endif %}>IMAP</option>
+          <option value="pop3" {% if current_protocol == 'pop3' %}selected{% endif %}>POP3</option>
+        </select>
+      </label>
+      <p class="hint">切换协议后请保存配置以生效。</p>
+
       <h2>IMAP 邮箱配置</h2>
+      <p class="hint">仅在选择 IMAP 协议时生效。</p>
       <label>IMAP 服务器地址：<input type="text" name="imap_host" value="{{ config.get('imap_host','') }}"></label>
       <label>IMAP 端口：<input type="text" name="imap_port" value="{{ config.get('imap_port','993') }}"></label>
       <label>邮箱账号：<input type="text" name="imap_user" value="{{ config.get('imap_user','') }}"></label>
       <label>邮箱密码/授权码：<input type="password" name="imap_pass" value="{{ config.get('imap_pass','') }}"></label>
+      {% if current_protocol == 'imap' %}
       <label>读取邮箱文件夹：
         {% if mailboxes %}
           <select name="imap_mailbox">
@@ -44,6 +56,12 @@
           <small class="hint">尚未获取邮箱列表，可先填写名称或点击下方按钮验证后选择。</small>
         {% endif %}
       </label>
+      {% else %}
+      <label>读取邮箱文件夹（IMAP 专用）：
+        <input type="text" name="imap_mailbox" value="{{ config.get('imap_mailbox','') }}">
+        <small class="hint">当前选择 POP3，此设置将被忽略。</small>
+      </label>
+      {% endif %}
       <h3>IMAP 客户端标识（ID 命令，可选）</h3>
       <p class="hint">当服务器要求提供 IMAP ID 信息时，可在此设置客户端名称、版本等标识以避免 Unsafe Login。</p>
       <label>客户端名称（name）：<input type="text" name="imap_id_name" value="{{ config.get('imap_id_name') or default_imap_id['name'] }}"></label>
@@ -54,6 +72,23 @@
       <div class="form-actions inline">
         <button type="button" id="restore-imap-id-defaults">恢复默认值</button>
       </div>
+
+      <h2>POP3 邮箱配置</h2>
+      <p class="hint">仅在选择 POP3 协议时生效。</p>
+      <label>POP3 服务器地址：<input type="text" name="pop3_host" value="{{ config.get('pop3_host','') }}"></label>
+      <label>POP3 端口：<input type="text" name="pop3_port" value="{{ config.get('pop3_port','995') }}"></label>
+      <label>邮箱账号：<input type="text" name="pop3_user" value="{{ config.get('pop3_user','') }}"></label>
+      <label>邮箱密码/授权码：<input type="password" name="pop3_pass" value="{{ config.get('pop3_pass','') }}"></label>
+      <label>使用 SSL（995 推荐）：
+        {% set pop3_ssl_value = config.get('pop3_use_ssl', 'true') %}
+        {% if pop3_ssl_value is string %}
+          {% set pop3_ssl_flag = pop3_ssl_value.lower() %}
+        {% else %}
+          {% set pop3_ssl_flag = 'true' if pop3_ssl_value else 'false' %}
+        {% endif %}
+        <input type="checkbox" name="pop3_use_ssl" value="true" {% if pop3_ssl_flag not in ['false', '0', 'no', 'off'] %}checked{% endif %}>
+        <small class="hint">取消勾选将使用明文连接，谨慎操作。</small>
+      </label>
       <h2>SMTP 发件配置</h2>
       <label>SMTP 服务器地址：<input type="text" name="smtp_host" value="{{ config.get('smtp_host','') }}"></label>
       <label>SMTP 端口：<input type="text" name="smtp_port" value="{{ config.get('smtp_port','465') }}"></label>
@@ -66,7 +101,9 @@
       <label>DeepSeek Token：<input type="text" name="deepseek_token" value="{{ config.get('deepseek_token','') }}"></label>
       <div class="form-actions">
         <button type="submit" name="action" value="save">保存配置</button>
+        {% if current_protocol != 'pop3' %}
         <button type="submit" name="action" value="fetch_mailboxes">验证并获取邮箱列表</button>
+        {% endif %}
       </div>
     </form>
   </main>

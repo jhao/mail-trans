@@ -7,6 +7,7 @@ from datetime import datetime
 from flask import Flask, render_template, request, redirect, url_for, flash
 from apscheduler.schedulers.background import BackgroundScheduler
 import imaplib
+import poplib
 import smtplib
 from email.header import decode_header
 from email.mime.text import MIMEText
@@ -249,6 +250,117 @@ def _find_inbox_name(mailboxes: list[str]) -> str | None:
     return None
 
 
+def _decode_header_value(value: str | None) -> str:
+    """解析邮件头字段，兼容多段编码。"""
+
+    if not value:
+        return ""
+
+    decoded_chunks: list[str] = []
+    for chunk, encoding in decode_header(value):
+        if isinstance(chunk, bytes):
+            try:
+                decoded_chunks.append(chunk.decode(encoding or 'utf-8', errors='ignore'))
+            except Exception:
+                decoded_chunks.append(chunk.decode('utf-8', errors='ignore'))
+        elif isinstance(chunk, str):
+            decoded_chunks.append(chunk)
+    return ''.join(decoded_chunks)
+
+
+def _extract_email_body(msg: email.message.Message) -> str:
+    """从邮件对象中提取正文内容，优先纯文本。"""
+
+    body = ""
+    if msg.is_multipart():
+        logging.debug("邮件 %s 为多部分结构，开始解析。", _decode_header_value(msg.get('Subject')))
+        for part in msg.walk():
+            content_type = part.get_content_type()
+            content_disposition = str(part.get("Content-Disposition"))
+            if content_type == "text/plain" and 'attachment' not in content_disposition:
+                try:
+                    charset = part.get_content_charset() or 'utf-8'
+                    payload = part.get_payload(decode=True)
+                    if payload is not None:
+                        body = payload.decode(charset, errors='ignore')
+                except Exception:
+                    payload = part.get_payload(decode=True)
+                    if payload is not None:
+                        body = payload.decode('utf-8', errors='ignore')
+                if body:
+                    break
+        if not body:
+            logging.debug("邮件 %s 未找到纯文本部分，尝试解析 HTML。", _decode_header_value(msg.get('Subject')))
+            for part in msg.walk():
+                content_type = part.get_content_type()
+                content_disposition = str(part.get("Content-Disposition"))
+                if content_type == "text/html" and 'attachment' not in content_disposition:
+                    try:
+                        charset = part.get_content_charset() or 'utf-8'
+                        payload = part.get_payload(decode=True)
+                        if payload is not None:
+                            body = payload.decode(charset, errors='ignore')
+                    except Exception:
+                        payload = part.get_payload(decode=True)
+                        if payload is not None:
+                            body = payload.decode('utf-8', errors='ignore')
+                    if body:
+                        break
+    else:
+        content_type = msg.get_content_type()
+        logging.debug("邮件 %s 为单部分，内容类型 %s。", _decode_header_value(msg.get('Subject')), content_type)
+        if content_type in ["text/plain", "text/html"]:
+            try:
+                charset = msg.get_content_charset() or 'utf-8'
+                payload = msg.get_payload(decode=True)
+                if payload is not None:
+                    body = payload.decode(charset, errors='ignore')
+            except Exception:
+                payload = msg.get_payload(decode=True)
+                if payload is not None:
+                    body = payload.decode('utf-8', errors='ignore')
+    return body
+
+
+def _parse_email_message(
+    msg: email.message.Message,
+    sender_list: list[str],
+    deepseek_token: str,
+) -> dict[str, str] | None:
+    """解析邮件对象并根据发件人筛选返回处理结果。"""
+
+    subject = _decode_header_value(msg.get("Subject"))
+    from_ = _decode_header_value(msg.get("From"))
+    matched = False
+    if sender_list:
+        logging.debug("启用发件人过滤规则：%s", ', '.join(sender_list))
+        for sender in sender_list:
+            if sender.lower() in from_.lower():
+                matched = True
+                break
+    else:
+        logging.debug("未配置发件人过滤，全部未读邮件均处理。")
+        matched = True
+    if not matched:
+        logging.debug("邮件 %s 不满足发件人过滤条件，跳过。", subject or '(无主题)')
+        return None
+
+    body = _extract_email_body(msg)
+    if not body:
+        logging.debug("邮件 %s 未能提取正文，跳过。", subject or '(无主题)')
+        return None
+
+    chinese = deepseek_translate(body, deepseek_token)
+    summary = deepseek_summarize(chinese, deepseek_token)
+    return {
+        "subject": subject,
+        "from": from_,
+        "original": body,
+        "chinese": chinese,
+        "summary": summary,
+    }
+
+
 def load_config():
     """读取配置文件，不存在则返回空字典"""
     if os.path.exists(CONFIG_FILE):
@@ -363,12 +475,20 @@ def process_emails():
     timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     log_entry = {"time": timestamp, "success": False, "message": ""}
 
-    # 必要配置检查
-    required_fields = [
-        'imap_host', 'imap_port', 'imap_user', 'imap_pass',
+    mail_protocol = str(config.get('mail_protocol') or 'imap').lower()
+    if mail_protocol not in {'imap', 'pop3'}:
+        mail_protocol = 'imap'
+
+    common_required = [
         'smtp_host', 'smtp_port', 'smtp_user', 'smtp_pass',
         'forward_email', 'senders', 'deepseek_token'
     ]
+    protocol_required = [
+        'imap_host', 'imap_port', 'imap_user', 'imap_pass'
+    ] if mail_protocol == 'imap' else [
+        'pop3_host', 'pop3_port', 'pop3_user', 'pop3_pass'
+    ]
+    required_fields = protocol_required + common_required
     missing_fields = [field for field in required_fields if not config.get(field)]
     if missing_fields:
         logging.error("任务配置缺失字段：%s", ', '.join(missing_fields))
@@ -378,178 +498,197 @@ def process_emails():
         return
     logging.debug("所有必要配置均已填写。")
 
-    # 解析配置
-    imap_host = config.get('imap_host')
-    imap_port = int(config.get('imap_port', 993))
-    imap_user = config.get('imap_user')
-    imap_pass = config.get('imap_pass')
     smtp_host = config.get('smtp_host')
     smtp_port = int(config.get('smtp_port', 465))
     smtp_user = config.get('smtp_user')
     smtp_pass = config.get('smtp_pass')
     forward_email = config.get('forward_email')
-    # 发件人过滤规则，允许多个发件人逗号分隔
     sender_list = [s.strip() for s in config.get('senders', '').split(',') if s.strip()]
     deepseek_token = config.get('deepseek_token')
-    imap_id_params = _build_imap_id_params(config)
 
-    processed_emails = []
+    processed_emails: list[dict[str, str]] = []
     try:
-        # 连接 IMAP
-        mail = imaplib.IMAP4_SSL(imap_host, imap_port)
-        mail.login(imap_user, imap_pass)
-        _send_imap_id(mail, imap_id_params)
-        target_mailbox = config.get('imap_mailbox') or 'INBOX'
-        encoded_mailbox = target_mailbox
-        try:
-            encoded_mailbox = _imap_encode_utf7(target_mailbox)
-            if encoded_mailbox != target_mailbox:
-                logging.info("IMAP 邮箱名称 UTF-7 编码: %s -> %s", target_mailbox, encoded_mailbox)
-            else:
-                logging.debug("IMAP 邮箱名称无需 UTF-7 编码: %s", target_mailbox)
-        except Exception as exc:
-            logging.warning("IMAP 邮箱名称 UTF-7 编码失败，使用原值: %s，错误: %s", target_mailbox, exc)
-            encoded_mailbox = target_mailbox
-        status, data = mail.select(encoded_mailbox)
-        if status == 'OK':
-            logging.info("IMAP 邮箱 %s 选择成功。", target_mailbox)
-        detail = ''
-        if status != 'OK':
-            if data:
+        if mail_protocol == 'pop3':
+            pop_host = config.get('pop3_host')
+            pop_port = int(config.get('pop3_port', 995))
+            pop_user = config.get('pop3_user')
+            pop_pass = config.get('pop3_pass')
+            pop_use_ssl_raw = config.get('pop3_use_ssl', 'true')
+            use_ssl = str(pop_use_ssl_raw).lower() not in {'false', '0', 'no', 'off'}
+            pop_conn: poplib.POP3 | None = None
+            try:
+                pop_conn = poplib.POP3_SSL(pop_host, pop_port) if use_ssl else poplib.POP3(pop_host, pop_port)
+                pop_conn.user(pop_user)
+                pop_conn.pass_(pop_pass)
                 try:
-                    detail = data[0].decode('utf-8', errors='ignore')
+                    welcome = pop_conn.getwelcome()
+                    welcome_text = welcome.decode('utf-8', errors='ignore') if isinstance(welcome, bytes) else str(welcome)
+                    logging.info("POP3 登录成功，欢迎语：%s", welcome_text)
                 except Exception:
-                    detail = str(data)
-                logging.debug("IMAP 选择失败的原始响应: %s", detail)
-            lower_detail = detail.lower()
-            if 'unsafe login' in lower_detail:
-                logging.warning("选择邮箱 %s 时触发 Unsafe Login，尝试获取邮箱列表后重试。", target_mailbox)
+                    logging.debug("POP3 登录成功，但欢迎语解析失败。", exc_info=True)
+
+                processed_uidls = config.get('pop3_processed_uidls')
+                if not isinstance(processed_uidls, list):
+                    processed_uidls = []
+                seen_uidls = set(str(uid) for uid in processed_uidls)
+
+                uidl_supported = True
                 try:
-                    available_mailboxes = _list_imap_mailboxes(mail)
-                except Exception as exc:
-                    logging.warning("获取邮箱列表用于重试失败：%s", exc)
-                    available_mailboxes = []
-                else:
-                    logging.info("成功获取 %d 个邮箱用于重试。", len(available_mailboxes))
-                fallback_mailbox = _find_inbox_name(available_mailboxes)
-                if fallback_mailbox and fallback_mailbox != target_mailbox:
-                    logging.info("使用备用收件箱名称 %s 重试选择。", fallback_mailbox)
-                    try:
-                        encoded_mailbox = _imap_encode_utf7(fallback_mailbox)
-                    except Exception:
-                        encoded_mailbox = fallback_mailbox
-                        logging.debug("备用邮箱 %s 使用原值进行选择。", fallback_mailbox)
-                    retry_status, retry_data = mail.select(encoded_mailbox)
-                    if retry_status == 'OK':
-                        logging.info("备用邮箱 %s 选择成功。", fallback_mailbox)
-                        status = retry_status
-                        data = retry_data
-                        target_mailbox = fallback_mailbox
-                        detail = ''
-                    else:
-                        retry_detail = ''
-                        if retry_data:
-                            try:
-                                retry_detail = retry_data[0].decode('utf-8', errors='ignore')
-                            except Exception:
-                                retry_detail = str(retry_data)
-                        logging.warning("备用邮箱 %s 选择失败: %s", fallback_mailbox, retry_detail)
-                elif fallback_mailbox == target_mailbox:
-                    logging.info("获取到的备用邮箱与当前目标一致：%s，跳过重试。", fallback_mailbox)
-                else:
-                    logging.warning("未找到可用的备用收件箱用于重试。")
-            if status != 'OK':
-                if 'unsafe login' not in lower_detail:
-                    logging.error("IMAP 选择邮箱 %s 失败，原因: %s", target_mailbox, detail or '未知')
-                raise Exception(f"IMAP 选择邮箱失败：{target_mailbox}{(' - ' + detail) if detail else ''}")
-        # 搜索未读邮件
-        status, messages = mail.search(None, 'UNSEEN')
-        if status != 'OK':
-            raise Exception('IMAP 搜索失败')
-        email_ids = messages[0].split()
-        for num in email_ids:
-            res, data = mail.fetch(num, '(RFC822)')
-            if res != 'OK':
-                continue
-            msg = email.message_from_bytes(data[0][1])
-            # 解析主题
-            subject, encoding = decode_header(msg.get("Subject"))[0]
-            if isinstance(subject, bytes):
-                try:
-                    subject = subject.decode(encoding or 'utf-8', errors='ignore')
-                except Exception:
-                    subject = subject.decode('utf-8', errors='ignore')
-            else:
-                subject = subject or ''
-            from_ = msg.get("From", "")
-            # 发件人筛选
-            matched = False
-            if sender_list:
-                logging.debug("启用发件人过滤规则：%s", ', '.join(sender_list))
-                for s in sender_list:
-                    if s.lower() in from_.lower():
-                        matched = True
-                        break
-            else:
-                logging.debug("未配置发件人过滤，全部未读邮件均处理。")
-                matched = True
-            if not matched:
-                logging.debug("邮件 %s 不满足发件人过滤条件，跳过。", subject)
-                continue
-            # 提取正文
-            body = ""
-            if msg.is_multipart():
-                logging.debug("邮件 %s 为多部分结构，开始解析。", subject)
-                # 优先取纯文本部分
-                for part in msg.walk():
-                    content_type = part.get_content_type()
-                    content_disposition = str(part.get("Content-Disposition"))
-                    if content_type == "text/plain" and 'attachment' not in content_disposition:
+                    _, uidl_entries, _ = pop_conn.uidl()
+                    raw_uidl_entries = list(uidl_entries or [])
+                    logging.debug("POP3 UIDL 响应共 %d 条。", len(raw_uidl_entries))
+                except poplib.error_proto as exc:
+                    uidl_supported = False
+                    logging.warning("POP3 服务器不支持 UIDL 命令：%s，退回使用 LIST。", exc)
+                    _, list_entries, _ = pop_conn.list()
+                    raw_uidl_entries = []
+                    for entry in list_entries or []:
                         try:
-                            charset = part.get_content_charset() or 'utf-8'
-                            body = part.get_payload(decode=True).decode(charset, errors='ignore')
+                            decoded = entry.decode()
+                            number = decoded.split()[0]
                         except Exception:
-                            body = part.get_payload(decode=True).decode('utf-8', errors='ignore')
-                        break
-                # 如果没有纯文本，再尝试读取 html
-                if not body:
-                    logging.debug("邮件 %s 未找到纯文本部分，尝试解析 HTML。", subject)
-                    for part in msg.walk():
-                        content_type = part.get_content_type()
-                        content_disposition = str(part.get("Content-Disposition"))
-                        if content_type == "text/html" and 'attachment' not in content_disposition:
-                            try:
-                                charset = part.get_content_charset() or 'utf-8'
-                                body = part.get_payload(decode=True).decode(charset, errors='ignore')
-                            except Exception:
-                                body = part.get_payload(decode=True).decode('utf-8', errors='ignore')
-                            break
-            else:
-                content_type = msg.get_content_type()
-                logging.debug("邮件 %s 为单部分，内容类型 %s。", subject, content_type)
-                if content_type in ["text/plain", "text/html"]:
+                            continue
+                        raw_uidl_entries.append(f"{number} {number}".encode())
+
+                new_uid_pairs: list[tuple[str, str]] = []
+                for raw in raw_uidl_entries:
                     try:
-                        charset = msg.get_content_charset() or 'utf-8'
-                        body = msg.get_payload(decode=True).decode(charset, errors='ignore')
+                        decoded = raw.decode()
                     except Exception:
-                        body = msg.get_payload(decode=True).decode('utf-8', errors='ignore')
-            if not body:
-                logging.debug("邮件 %s 未能提取正文，跳过。", subject)
-                continue
-            # 调用 DeepSeek 翻译
-            chinese = deepseek_translate(body, deepseek_token)
-            # 摘要
-            summary = deepseek_summarize(chinese, deepseek_token)
-            processed_emails.append({
-                "subject": subject,
-                "from": from_,
-                "original": body,
-                "chinese": chinese,
-                "summary": summary
-            })
-        mail.logout()
+                        continue
+                    parts = decoded.split()
+                    if len(parts) < 2:
+                        continue
+                    number, uidl = parts[0], parts[1]
+                    normalized_uidl = uidl if uidl_supported else f"list-{uidl}"
+                    if normalized_uidl not in seen_uidls:
+                        new_uid_pairs.append((number, normalized_uidl))
+                new_uid_pairs.sort(key=lambda pair: int(pair[0]))
+                logging.info("POP3 共检测到 %d 封新邮件。", len(new_uid_pairs))
+
+                processed_this_run: list[str] = []
+                for number, normalized_uidl in new_uid_pairs:
+                    try:
+                        _, lines, _ = pop_conn.retr(int(number))
+                    except Exception as exc:
+                        logging.warning("POP3 拉取第 %s 封邮件失败：%s", number, exc)
+                        continue
+                    processed_this_run.append(normalized_uidl)
+                    msg_content = b"\r\n".join(lines)
+                    msg = email.message_from_bytes(msg_content)
+                    parsed = _parse_email_message(msg, sender_list, deepseek_token)
+                    if parsed:
+                        processed_emails.append(parsed)
+
+                if processed_this_run:
+                    for uidl in processed_this_run:
+                        if uidl not in seen_uidls:
+                            processed_uidls.append(uidl)
+                            seen_uidls.add(uidl)
+                    max_history = 500
+                    if len(processed_uidls) > max_history:
+                        processed_uidls = processed_uidls[-max_history:]
+                    config['pop3_processed_uidls'] = processed_uidls
+                    save_config(config)
+            finally:
+                if pop_conn:
+                    try:
+                        pop_conn.quit()
+                    except Exception:
+                        pass
+        else:
+            imap_host = config.get('imap_host')
+            imap_port = int(config.get('imap_port', 993))
+            imap_user = config.get('imap_user')
+            imap_pass = config.get('imap_pass')
+            imap_id_params = _build_imap_id_params(config)
+            target_mailbox = config.get('imap_mailbox') or 'INBOX'
+            mail: imaplib.IMAP4 | None = None
+            try:
+                mail = imaplib.IMAP4_SSL(imap_host, imap_port)
+                mail.login(imap_user, imap_pass)
+                _send_imap_id(mail, imap_id_params)
+                encoded_mailbox = target_mailbox
+                try:
+                    encoded_mailbox = _imap_encode_utf7(target_mailbox)
+                    if encoded_mailbox != target_mailbox:
+                        logging.info("IMAP 邮箱名称 UTF-7 编码: %s -> %s", target_mailbox, encoded_mailbox)
+                    else:
+                        logging.debug("IMAP 邮箱名称无需 UTF-7 编码: %s", target_mailbox)
+                except Exception as exc:
+                    logging.warning("IMAP 邮箱名称 UTF-7 编码失败，使用原值: %s，错误: %s", target_mailbox, exc)
+                    encoded_mailbox = target_mailbox
+                status, data = mail.select(encoded_mailbox)
+                if status == 'OK':
+                    logging.info("IMAP 邮箱 %s 选择成功。", target_mailbox)
+                detail = ''
+                if status != 'OK':
+                    if data:
+                        try:
+                            detail = data[0].decode('utf-8', errors='ignore')
+                        except Exception:
+                            detail = str(data)
+                        logging.debug("IMAP 选择失败的原始响应: %s", detail)
+                    lower_detail = detail.lower()
+                    if 'unsafe login' in lower_detail:
+                        logging.warning("选择邮箱 %s 时触发 Unsafe Login，尝试获取邮箱列表后重试。", target_mailbox)
+                        try:
+                            available_mailboxes = _list_imap_mailboxes(mail)
+                        except Exception as exc:
+                            logging.warning("获取邮箱列表用于重试失败：%s", exc)
+                            available_mailboxes = []
+                        else:
+                            logging.info("成功获取 %d 个邮箱用于重试。", len(available_mailboxes))
+                        fallback_mailbox = _find_inbox_name(available_mailboxes)
+                        if fallback_mailbox and fallback_mailbox != target_mailbox:
+                            logging.info("使用备用收件箱名称 %s 重试选择。", fallback_mailbox)
+                            try:
+                                encoded_mailbox = _imap_encode_utf7(fallback_mailbox)
+                            except Exception:
+                                encoded_mailbox = fallback_mailbox
+                                logging.debug("备用邮箱 %s 使用原值进行选择。", fallback_mailbox)
+                            retry_status, retry_data = mail.select(encoded_mailbox)
+                            if retry_status == 'OK':
+                                logging.info("备用邮箱 %s 选择成功。", fallback_mailbox)
+                                status = retry_status
+                                data = retry_data
+                                target_mailbox = fallback_mailbox
+                                detail = ''
+                            else:
+                                retry_detail = ''
+                                if retry_data:
+                                    try:
+                                        retry_detail = retry_data[0].decode('utf-8', errors='ignore')
+                                    except Exception:
+                                        retry_detail = str(retry_data)
+                                logging.warning("备用邮箱 %s 选择失败: %s", fallback_mailbox, retry_detail)
+                        elif fallback_mailbox == target_mailbox:
+                            logging.info("获取到的备用邮箱与当前目标一致：%s，跳过重试。", fallback_mailbox)
+                        else:
+                            logging.warning("未找到可用的备用收件箱用于重试。")
+                    if status != 'OK':
+                        if 'unsafe login' not in lower_detail:
+                            logging.error("IMAP 选择邮箱 %s 失败，原因: %s", target_mailbox, detail or '未知')
+                        raise Exception(f"IMAP 选择邮箱失败：{target_mailbox}{(' - ' + detail) if detail else ''}")
+                status, messages = mail.search(None, 'UNSEEN')
+                if status != 'OK':
+                    raise Exception('IMAP 搜索失败')
+                email_ids = messages[0].split()
+                for num in email_ids:
+                    res, data = mail.fetch(num, '(RFC822)')
+                    if res != 'OK':
+                        continue
+                    msg = email.message_from_bytes(data[0][1])
+                    parsed = _parse_email_message(msg, sender_list, deepseek_token)
+                    if parsed:
+                        processed_emails.append(parsed)
+            finally:
+                if mail:
+                    try:
+                        mail.logout()
+                    except Exception:
+                        pass
     except Exception as e:
-        # 处理过程报错
         log_entry['message'] = f"处理邮件出现异常: {str(e)}"
         logs.append(log_entry)
         save_logs(logs)
@@ -629,6 +768,10 @@ def config_page():
     if request.method == 'POST':
         action = request.form.get('action', 'save')
         # 保存用户提交的配置
+        mail_protocol = request.form.get('mail_protocol', 'imap').strip().lower()
+        if mail_protocol not in {'imap', 'pop3'}:
+            mail_protocol = 'imap'
+        config['mail_protocol'] = mail_protocol
         config['imap_host'] = request.form.get('imap_host', '').strip()
         config['imap_port'] = request.form.get('imap_port', '').strip()
         config['imap_user'] = request.form.get('imap_user', '').strip()
@@ -639,6 +782,11 @@ def config_page():
         config['imap_id_vendor'] = request.form.get('imap_id_vendor', '').strip()
         config['imap_id_support_url'] = request.form.get('imap_id_support_url', '').strip()
         config['imap_id_support_email'] = request.form.get('imap_id_support_email', '').strip()
+        config['pop3_host'] = request.form.get('pop3_host', '').strip()
+        config['pop3_port'] = request.form.get('pop3_port', '').strip()
+        config['pop3_user'] = request.form.get('pop3_user', '').strip()
+        config['pop3_pass'] = request.form.get('pop3_pass', '').strip()
+        config['pop3_use_ssl'] = 'true' if request.form.get('pop3_use_ssl') else 'false'
         config['smtp_host'] = request.form.get('smtp_host', '').strip()
         config['smtp_port'] = request.form.get('smtp_port', '').strip()
         config['smtp_user'] = request.form.get('smtp_user', '').strip()
@@ -648,6 +796,15 @@ def config_page():
         config['deepseek_token'] = request.form.get('deepseek_token', '').strip()
 
         if action == 'fetch_mailboxes':
+            if config['mail_protocol'] == 'pop3':
+                flash("POP3 协议不支持获取邮箱文件夹列表。")
+                return render_template(
+                    'config.html',
+                    config=config,
+                    mailboxes=mailboxes,
+                    fetched_mailboxes=None,
+                    default_imap_id=DEFAULT_IMAP_ID,
+                )
             try:
                 id_params = _build_imap_id_params(config)
                 mailboxes = fetch_imap_mailboxes(
