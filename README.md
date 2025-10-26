@@ -1,6 +1,6 @@
 # 邮件汇总系统
 
-一个基于 Python Flask 的邮件汇总与转发服务，用于定时从企业邮箱拉取未读邮件，调用 DeepSeek API 完成翻译与摘要，并通过 HTML 邮件的形式将目录化内容转发给指定收件人。系统自带 Web 管理界面，可视化查看运行日志、手动触发任务以及维护 IMAP/SMTP/DeepSeek 等核心配置。
+一个基于 Python Flask 的邮件汇总与转发服务，用于定时从企业邮箱（支持 IMAP 与 POP3 协议）拉取未读邮件，调用 DeepSeek API 完成翻译与摘要，并通过 HTML 邮件的形式将目录化内容转发给指定收件人。系统自带 Web 管理界面，可视化查看运行日志、手动触发任务以及维护收件协议/SMTP/DeepSeek 等核心配置。
 
 ## 目录
 - [功能概览](#功能概览)
@@ -15,7 +15,7 @@
 - [许可证](#许可证)
 
 ## 功能概览
-- **未读邮件采集**：周期性连接 IMAP 邮箱，筛选符合发件人规则的未读邮件。
+- **未读邮件采集**：周期性连接 IMAP 或 POP3 邮箱，筛选符合发件人规则的未读邮件。
 - **自动翻译与摘要**：调用 DeepSeek API 将正文翻译为中文并生成概览。
 - **HTML 汇总邮件**：构建带目录锚点的 HTML 内容，并使用 SMTP 发送到目标邮箱。
 - **Web 管理台**：通过 Flask 模板提供首页、配置页、日志页三大界面，支持手动执行任务和查看运行记录。
@@ -46,17 +46,17 @@ mail-trans/
 
 3. **邮件处理流水线**（`process_emails` 函数）：
    - 读取配置后校验必填项。
-   - 连接 IMAP（使用 `imaplib`）获取未读邮件，解析主题、发件人和正文。
+   - 按配置选择连接 IMAP（使用 `imaplib`）或 POP3（使用 `poplib`）获取未读邮件，解析主题、发件人和正文。
    - 通过 `deepseek_translate`、`deepseek_summarize` 调用 DeepSeek API 处理文本。
    - 将结果汇总成带目录锚点的 HTML 内容，使用 `smtplib` 通过 SMTP 发送。
    - 记录执行结果到 `logs.json`，供前端展示。
 
 4. **外部服务集成**：
-   - IMAP/SMTP：用于收取与发送邮件。
+   - IMAP/POP3/SMTP：用于收取与发送邮件。
    - DeepSeek API：提供翻译与摘要服务，可按需求替换为自研/其它第三方接口。
 
 ### 数据流示意
-1. 调度器触发 `process_emails` → 连接 IMAP → 拉取未读邮件。
+1. 调度器触发 `process_emails` → 按配置连接 IMAP/POP3 → 拉取未读邮件。
 2. 对符合筛选条件的邮件执行翻译/摘要 → 生成目录化 HTML。
 3. 通过 SMTP 将汇总邮件转发 → 写入执行日志。
 4. Web 层从 `logs.json` 读取最近记录，用于页面展示；配置更新写回 `config.json`。
@@ -64,7 +64,7 @@ mail-trans/
 ## 环境准备
 - Python >= 3.9（建议 3.11）。
 - 可访问互联网（需要访问邮箱服务器和 DeepSeek API）。
-- 拥有目标邮箱的 IMAP/SMTP 权限及授权码。
+- 拥有目标邮箱的 IMAP 或 POP3 权限，以及 SMTP 授权码。
 
 ### 1. 克隆项目
 ```bash
@@ -89,7 +89,7 @@ pip install -r requirements.txt
 python app.py
 ```
 默认监听 `http://0.0.0.0:5000/`，浏览器访问后即可使用：
-1. 首次进入首页点击导航中的“配置”，填写 IMAP/SMTP/DeepSeek 参数并保存。
+1. 首次进入首页点击导航中的“配置”，根据需求填写 IMAP/POP3/SMTP/DeepSeek 参数并保存。
 2. 返回首页可手动点击“立即执行任务”验证流程。
 3. “日志”页面可查看历史执行信息。
 
@@ -128,14 +128,14 @@ Python 应用无需编译，但建议使用 WSGI 服务器托管，并将调度�
    > 若使用 Docker，请确保挂载配置和日志文件，避免容器重建导致数据丢失。
 
 ## 配置与数据文件
-- `config.json`：由配置界面写入，包含 IMAP/SMTP 凭证、发件人过滤、DeepSeek token、转发邮箱等信息。
+- `config.json`：由配置界面写入，包含 IMAP/POP3/SMTP 凭证、发件人过滤、DeepSeek token、转发邮箱等信息，并在 POP3 模式下记录已处理的 UIDL 以避免重复。
 - `logs.json`：追加存储每次运行的时间、成功状态与描述。
 - 两个文件均位于项目根目录，建议设置合理的文件权限，避免敏感信息泄漏。
 
 ## 核心技术点说明
 1. **Flask + Jinja2**：快速构建轻量级管理界面，满足配置与日志查看需求。路由处理详见 `index`、`config_page`、`logs_page`。  
 2. **APScheduler `BackgroundScheduler`**：在 Web 应用内部维护稳定的定时任务，确保每小时触发邮件处理逻辑。  
-3. **IMAP/SMTP 协议栈**：通过 `imaplib` 和 `smtplib` 与邮箱服务器交互，支持多发件人过滤、HTML 邮件发送。  
+3. **IMAP/POP3/SMTP 协议栈**：通过 `imaplib`、`poplib` 和 `smtplib` 与邮箱服务器交互，支持多发件人过滤、HTML 邮件发送。
 4. **DeepSeek API 对接**：`requests` 调用外部翻译/摘要服务，失败时自动降级使用原文/截取内容，增强健壮性。  
 5. **JSON 配置与日志**：配置与日志均采用 JSON 文件存储，简单直观，便于自动化备份与查看。
 
