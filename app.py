@@ -20,7 +20,7 @@ import requests
 
 该模块实现了以下功能：
 1. 使用 IMAP 协议从 163 邮箱读取未读邮件，并根据配置的发件人筛选条件过滤。
-2. 调用 DeepSeek API 将邮件正文翻译成中文并生成简要概览（当前为示例实现）。
+2. 调用 DeepSeek API 将邮件正文翻译成中文并生成简要概览。
 3. 按照目录卡片的形式构建 HTML 内容并通过 SMTP 邮件发送到指定邮箱。
 4. 通过 Flask 提供 Web 界面，允许用户查看最近运行记录、手动触发任务、修改配置并查看日志。
 5. 使用 APScheduler 以后台调度的方式每小时执行一次邮件检查任务。
@@ -50,6 +50,18 @@ UNSAFE_PORTS = {
     548, 556, 563, 587, 601, 636, 993, 995, 2049, 3659, 4045, 6000, 6665, 6666,
     6667, 6668, 6669, 6697, 10080,
 }
+
+DEEPSEEK_CHAT_COMPLETIONS_URL = "https://api.deepseek.com/v1/chat/completions"
+
+
+def _trim_text_for_prompt(text: str, limit: int = 6000) -> str:
+    """Prepare text for prompt by trimming whitespace and clipping length."""
+
+    cleaned = (text or "").strip()
+    if len(cleaned) > limit:
+        logging.debug("邮件正文长度 %d 超出 %d，截断后再发送 DeepSeek。", len(cleaned), limit)
+        return cleaned[:limit]
+    return cleaned
 
 
 def _build_imap_id_params(config: dict | None = None) -> dict[str, str]:
@@ -395,29 +407,106 @@ def save_logs(logs: list) -> None:
         json.dump(logs, f, ensure_ascii=False, indent=2)
 
 
+def _call_deepseek_chat(
+    messages: list[dict[str, str]],
+    token: str,
+    *,
+    model: str = "deepseek-chat",
+    temperature: float = 0.3,
+    max_tokens: int | None = 1024,
+    timeout: int = 30,
+) -> str | None:
+    """Invoke DeepSeek chat completions API and return the assistant content."""
+
+    if not token:
+        logging.debug("未配置 DeepSeek token，跳过 API 调用。")
+        return None
+    if not messages:
+        logging.debug("DeepSeek 请求缺少消息内容，跳过调用。")
+        return None
+
+    headers = {
+        'Authorization': f'Bearer {token}',
+        'Content-Type': 'application/json',
+    }
+    payload: dict[str, object] = {
+        "model": model,
+        "messages": messages,
+        "temperature": temperature,
+    }
+    if max_tokens is not None:
+        payload["max_tokens"] = max_tokens
+
+    try:
+        resp = requests.post(
+            DEEPSEEK_CHAT_COMPLETIONS_URL,
+            headers=headers,
+            json=payload,
+            timeout=timeout,
+        )
+    except requests.RequestException as exc:
+        logging.warning("DeepSeek API 请求异常：%s", exc)
+        return None
+
+    if resp.status_code != 200:
+        detail = resp.text[:200] if resp.text else resp.status_code
+        logging.warning("DeepSeek API 返回状态 %s：%s", resp.status_code, detail)
+        return None
+
+    try:
+        data = resp.json()
+    except ValueError:
+        logging.warning("DeepSeek API 响应 JSON 解析失败。")
+        return None
+
+    choices = data.get("choices") if isinstance(data, dict) else None
+    if not choices:
+        logging.warning("DeepSeek API 响应中未包含 choices 字段。")
+        return None
+
+    message = choices[0].get("message") if isinstance(choices[0], dict) else None
+    if not isinstance(message, dict):
+        logging.warning("DeepSeek API 响应 message 字段格式异常。")
+        return None
+
+    content = message.get("content")
+    if isinstance(content, str) and content.strip():
+        return content.strip()
+
+    logging.warning("DeepSeek API 响应缺少有效内容。")
+    return None
+
+
 def deepseek_translate(text: str, token: str) -> str:
     """调用 DeepSeek API 将文本翻译成中文。
 
     这里给出示例实现，实际使用时请根据 DeepSeek 官方文档调整接口地址和参数。
     若调用失败则返回原文本。
     """
-    headers = {
-        'Authorization': f'Bearer {token}',
-        'Content-Type': 'application/json',
-    }
-    payload = {
-        "model": "deepseek-translate",
-        "prompt": f"翻译成中文: {text}",
-        "temperature": 0.3,
-    }
-    try:
-        resp = requests.post('https://api.deepseek.com/v1/text/completions', headers=headers, json=payload, timeout=30)
-        if resp.status_code == 200:
-            data = resp.json()
-            # 假设返回格式中包含 choices 字段
-            return data.get('choices', [{}])[0].get('text', text)
-    except Exception:
-        pass
+    if not text:
+        return text
+
+    prompt_text = _trim_text_for_prompt(text)
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "你是一名专业的邮件翻译助手，负责将英文或其他语言邮件准确翻译为专业、自然的简体中文。"
+                "保留原始结构、段落和列表，不要加入额外说明。"
+            ),
+        },
+        {
+            "role": "user",
+            "content": (
+                "请将以下邮件正文翻译为简体中文，以便后续邮件汇总转发，保持原有段落与格式：\n\n"
+                f"{prompt_text}"
+            ),
+        },
+    ]
+
+    translated = _call_deepseek_chat(messages, token, temperature=0.2, max_tokens=2048)
+    if translated:
+        return translated
     return text
 
 
@@ -426,22 +515,30 @@ def deepseek_summarize(text: str, token: str) -> str:
 
     示例实现，若调用失败则返回原文本的前 200 个字符。
     """
-    headers = {
-        'Authorization': f'Bearer {token}',
-        'Content-Type': 'application/json',
-    }
-    payload = {
-        "model": "deepseek-summary",
-        "prompt": f"请用简洁的方式概括下面的内容，用中文回答:{text}",
-        "temperature": 0.3,
-    }
-    try:
-        resp = requests.post('https://api.deepseek.com/v1/text/completions', headers=headers, json=payload, timeout=30)
-        if resp.status_code == 200:
-            data = resp.json()
-            return data.get('choices', [{}])[0].get('text', text[:200])
-    except Exception:
-        pass
+    if not text:
+        return text
+
+    prompt_text = _trim_text_for_prompt(text)
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "你是一名专业的中文邮件助理，需要从邮件正文中提炼重点，突出关键信息和待办事项。"
+            ),
+        },
+        {
+            "role": "user",
+            "content": (
+                "请基于以下邮件正文生成一段不超过 150 字的中文摘要，突出主题、关键信息和可执行事项。"
+                "无需重复问候语，若无行动项可以省略：\n\n"
+                f"{prompt_text}"
+            ),
+        },
+    ]
+
+    summary = _call_deepseek_chat(messages, token, temperature=0.4, max_tokens=400)
+    if summary:
+        return summary
     return text[:200]
 
 
