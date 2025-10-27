@@ -56,6 +56,7 @@ UNSAFE_PORTS = {
 }
 
 DEEPSEEK_CHAT_COMPLETIONS_URL = "https://api.deepseek.com/v1/chat/completions"
+DEFAULT_DEEPSEEK_TIMEOUT = 120
 
 
 PASSWORD_SECRET = "f8a3c1b4de5"
@@ -467,6 +468,8 @@ def _parse_email_message(
     msg: email.message.Message,
     sender_list: list[str],
     deepseek_token: str,
+    *,
+    deepseek_timeout: float,
 ) -> dict[str, str] | None:
     """解析邮件对象并根据发件人筛选返回处理结果。"""
 
@@ -491,8 +494,8 @@ def _parse_email_message(
         logging.debug("邮件 %s 未能提取正文，跳过。", subject or '(无主题)')
         return None
 
-    chinese = deepseek_translate(body, deepseek_token)
-    summary = deepseek_summarize(chinese, deepseek_token)
+    chinese = deepseek_translate(body, deepseek_token, timeout=deepseek_timeout)
+    summary = deepseek_summarize(chinese, deepseek_token, timeout=deepseek_timeout)
     return {
         "subject": subject,
         "from": from_,
@@ -543,7 +546,7 @@ def _call_deepseek_chat(
     model: str = "deepseek-chat",
     temperature: float = 0.3,
     max_tokens: int | None = 1024,
-    timeout: int = 30,
+    timeout: float = DEFAULT_DEEPSEEK_TIMEOUT,
 ) -> str | None:
     """Invoke DeepSeek chat completions API and return the assistant content."""
 
@@ -606,7 +609,12 @@ def _call_deepseek_chat(
     return None
 
 
-def deepseek_translate(text: str, token: str) -> str:
+def deepseek_translate(
+    text: str,
+    token: str,
+    *,
+    timeout: float = DEFAULT_DEEPSEEK_TIMEOUT,
+) -> str:
     """调用 DeepSeek API 将文本翻译成中文。
 
     这里给出示例实现，实际使用时请根据 DeepSeek 官方文档调整接口地址和参数。
@@ -634,13 +642,24 @@ def deepseek_translate(text: str, token: str) -> str:
         },
     ]
 
-    translated = _call_deepseek_chat(messages, token, temperature=0.2, max_tokens=2048)
+    translated = _call_deepseek_chat(
+        messages,
+        token,
+        temperature=0.2,
+        max_tokens=2048,
+        timeout=timeout,
+    )
     if translated:
         return translated
     return text
 
 
-def deepseek_summarize(text: str, token: str) -> str:
+def deepseek_summarize(
+    text: str,
+    token: str,
+    *,
+    timeout: float = DEFAULT_DEEPSEEK_TIMEOUT,
+) -> str:
     """调用 DeepSeek API 对中文文本进行摘要。
 
     示例实现，若调用失败则返回原文本的前 200 个字符。
@@ -666,7 +685,13 @@ def deepseek_summarize(text: str, token: str) -> str:
         },
     ]
 
-    summary = _call_deepseek_chat(messages, token, temperature=0.4, max_tokens=400)
+    summary = _call_deepseek_chat(
+        messages,
+        token,
+        temperature=0.4,
+        max_tokens=400,
+        timeout=timeout,
+    )
     if summary:
         return summary
     return text[:200]
@@ -732,6 +757,21 @@ def process_emails():
     forward_email = config.get('forward_email')
     sender_list = [s.strip() for s in config.get('senders', '').split(',') if s.strip()]
     deepseek_token = config.get('deepseek_token')
+    deepseek_timeout_raw = config.get('deepseek_timeout')
+    deepseek_timeout = DEFAULT_DEEPSEEK_TIMEOUT
+    if deepseek_timeout_raw:
+        try:
+            deepseek_timeout = float(deepseek_timeout_raw)
+            if deepseek_timeout <= 0:
+                raise ValueError
+        except (TypeError, ValueError):
+            logging.warning(
+                "DeepSeek 超时时间配置无效：%s，使用默认值 %s 秒。",
+                deepseek_timeout_raw,
+                DEFAULT_DEEPSEEK_TIMEOUT,
+            )
+            deepseek_timeout = DEFAULT_DEEPSEEK_TIMEOUT
+    logging.debug("DeepSeek 请求超时时间设定为 %s 秒。", deepseek_timeout)
 
     processed_emails: list[dict[str, str]] = []
     try:
@@ -803,7 +843,12 @@ def process_emails():
                     processed_this_run.append(normalized_uidl)
                     msg_content = b"\r\n".join(lines)
                     msg = email.message_from_bytes(msg_content)
-                    parsed = _parse_email_message(msg, sender_list, deepseek_token)
+                    parsed = _parse_email_message(
+                        msg,
+                        sender_list,
+                        deepseek_token,
+                        deepseek_timeout=deepseek_timeout,
+                    )
                     if parsed:
                         processed_emails.append(parsed)
 
@@ -906,7 +951,12 @@ def process_emails():
                     if res != 'OK':
                         continue
                     msg = email.message_from_bytes(data[0][1])
-                    parsed = _parse_email_message(msg, sender_list, deepseek_token)
+                    parsed = _parse_email_message(
+                        msg,
+                        sender_list,
+                        deepseek_token,
+                        deepseek_timeout=deepseek_timeout,
+                    )
                     if parsed:
                         processed_emails.append(parsed)
             finally:
@@ -1069,6 +1119,9 @@ def config_page():
         config['forward_email'] = request.form.get('forward_email', '').strip()
         config['senders'] = request.form.get('senders', '').strip()
         config['deepseek_token'] = request.form.get('deepseek_token', '').strip()
+        timeout_value = request.form.get('deepseek_timeout', '').strip()
+        default_timeout_str = f"{DEFAULT_DEEPSEEK_TIMEOUT:g}"
+        config['deepseek_timeout'] = timeout_value or default_timeout_str
 
         if action == 'fetch_mailboxes':
             if config['mail_protocol'] == 'pop3':
@@ -1079,6 +1132,7 @@ def config_page():
                     mailboxes=mailboxes,
                     fetched_mailboxes=None,
                     default_imap_id=DEFAULT_IMAP_ID,
+                    deepseek_timeout_default=DEFAULT_DEEPSEEK_TIMEOUT,
                 )
             try:
                 id_params = _build_imap_id_params(config)
@@ -1102,6 +1156,7 @@ def config_page():
                 mailboxes=mailboxes,
                 fetched_mailboxes=mailboxes,
                 default_imap_id=DEFAULT_IMAP_ID,
+                deepseek_timeout_default=DEFAULT_DEEPSEEK_TIMEOUT,
             )
 
         config['available_mailboxes'] = mailboxes
@@ -1114,6 +1169,7 @@ def config_page():
         mailboxes=mailboxes,
         fetched_mailboxes=None,
         default_imap_id=DEFAULT_IMAP_ID,
+        deepseek_timeout_default=DEFAULT_DEEPSEEK_TIMEOUT,
     )
 
 

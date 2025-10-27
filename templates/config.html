@@ -103,6 +103,11 @@
       <label>发件人筛选（逗号分隔）：<input type="text" name="senders" placeholder="例如: sender1@example.com,sender2@163.com" value="{{ config.get('senders','') }}"></label>
       <h2>DeepSeek 配置</h2>
       <label>DeepSeek Token：<input type="text" name="deepseek_token" value="{{ config.get('deepseek_token','') }}"></label>
+      {% set timeout_value = config.get('deepseek_timeout') %}
+      <label>DeepSeek 请求超时时间（秒）：
+        <input type="number" name="deepseek_timeout" min="10" max="600" value="{{ timeout_value if timeout_value else deepseek_timeout_default }}">
+      </label>
+      <p class="hint">翻译接口响应较慢时，可在此延长等待时间。默认值为 {{ deepseek_timeout_default }} 秒。</p>
       <div class="form-actions">
         <button type="submit" name="action" value="save">保存配置</button>
         {% if current_protocol != 'pop3' %}
