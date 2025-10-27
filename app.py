@@ -3,8 +3,12 @@ import json
 import logging
 import re
 import base64
+import argparse
+import hashlib
+from functools import wraps
 from datetime import datetime
-from flask import Flask, render_template, request, redirect, url_for, flash
+from urllib.parse import urlparse
+from flask import Flask, render_template, request, redirect, url_for, flash, session
 from apscheduler.schedulers.background import BackgroundScheduler
 import imaplib
 import poplib
@@ -52,6 +56,131 @@ UNSAFE_PORTS = {
 }
 
 DEEPSEEK_CHAT_COMPLETIONS_URL = "https://api.deepseek.com/v1/chat/completions"
+
+
+PASSWORD_SECRET = "f8a3c1b4de5"
+AUTH_USER = "email_owner"
+SESSION_KEY = "auth_user"
+AUTH_CONFIG_KEY = "auth"
+AUTH_PASSWORD_FIELD = "password_hash"
+
+AUTH_PASSWORD_HASH: str | None = None
+
+
+def hash_password(password: str) -> str:
+    """Generate MD5 hash for the given password with secret salt."""
+
+    payload = f"{password}{PASSWORD_SECRET}"
+    return hashlib.md5(payload.encode("utf-8")).hexdigest()
+
+
+def verify_password(password: str, stored_hash: str | None) -> bool:
+    """Verify plain password against stored MD5 hash."""
+
+    if not stored_hash:
+        return False
+    return hash_password(password) == stored_hash
+
+
+def _extract_password_hash(config: dict | None = None) -> str | None:
+    """Fetch stored password hash for email_owner from config."""
+
+    if config is None:
+        config = load_config()
+    auth_section = config.get(AUTH_CONFIG_KEY)
+    if not isinstance(auth_section, dict):
+        return None
+    entry = auth_section.get(AUTH_USER)
+    if isinstance(entry, dict):
+        password_hash = entry.get(AUTH_PASSWORD_FIELD)
+    elif isinstance(entry, str):
+        password_hash = entry
+    else:
+        password_hash = None
+    if isinstance(password_hash, str) and password_hash.strip():
+        return password_hash.strip()
+    return None
+
+
+def set_auth_password_hash(password_hash: str, *, config: dict | None = None) -> None:
+    """Persist hashed password for email_owner."""
+
+    global AUTH_PASSWORD_HASH
+
+    if config is None:
+        config = load_config()
+    auth_section = config.get(AUTH_CONFIG_KEY)
+    if not isinstance(auth_section, dict):
+        auth_section = {}
+    auth_section[AUTH_USER] = {AUTH_PASSWORD_FIELD: password_hash}
+    config[AUTH_CONFIG_KEY] = auth_section
+    save_config(config)
+    AUTH_PASSWORD_HASH = password_hash
+
+
+def set_auth_password(password: str, *, config: dict | None = None) -> None:
+    """Set plain password for email_owner by hashing with secret."""
+
+    password_hash = hash_password(password)
+    set_auth_password_hash(password_hash, config=config)
+
+
+def initialize_auth(default_password: str | None = None) -> None:
+    """Ensure authentication state is initialized with stored or default password."""
+
+    global AUTH_PASSWORD_HASH
+
+    config = load_config()
+    stored_hash = _extract_password_hash(config)
+    if stored_hash:
+        AUTH_PASSWORD_HASH = stored_hash
+        return
+    if default_password:
+        logging.info("未检测到已设置的登录密码，使用启动参数中的默认密码初始化。")
+        set_auth_password(default_password, config=config)
+    else:
+        logging.warning("未提供默认登录密码 (--pwd) 且配置中不存在密码，系统将拒绝所有登录。")
+        AUTH_PASSWORD_HASH = None
+
+
+def is_authenticated() -> bool:
+    """Check whether current session is authenticated as email_owner."""
+
+    return session.get(SESSION_KEY) == AUTH_USER
+
+
+def login_required(view):
+    """Decorator to enforce authentication for protected routes."""
+
+    @wraps(view)
+    def wrapped_view(*args, **kwargs):
+        if is_authenticated():
+            return view(*args, **kwargs)
+        next_url = request.path
+        if request.query_string:
+            next_url = f"{request.path}?{request.query_string.decode()}"
+        flash("请先登录。")
+        return redirect(url_for('login', next=next_url))
+
+    return wrapped_view
+
+
+def _safe_next_url(candidate: str | None) -> str:
+    """Ensure next URL is safe and relative."""
+
+    if not candidate:
+        return url_for('index')
+    parsed = urlparse(candidate)
+    if parsed.scheme or parsed.netloc:
+        return url_for('index')
+    return candidate
+
+
+@app.context_processor
+def inject_auth_user() -> dict[str, str | None]:
+    """Expose current authenticated user to templates."""
+
+    return {"current_user": session.get(SESSION_KEY)}
 
 
 def _trim_text_for_prompt(text: str, limit: int = 6000) -> str:
@@ -839,7 +968,42 @@ def process_emails():
     save_logs(logs)
 
 
+@app.route('/login', methods=['GET', 'POST'])
+def login():
+    """Login page for email_owner user."""
+
+    next_candidate = request.args.get('next') or request.form.get('next')
+    next_url = _safe_next_url(next_candidate)
+    if is_authenticated():
+        return redirect(next_url)
+
+    if request.method == 'POST':
+        username = (request.form.get('username') or '').strip()
+        password = request.form.get('password') or ''
+        if username != AUTH_USER:
+            flash('用户名或密码错误。')
+        elif not AUTH_PASSWORD_HASH:
+            flash('系统尚未配置登录密码，请联系管理员。')
+        elif verify_password(password, AUTH_PASSWORD_HASH):
+            session[SESSION_KEY] = AUTH_USER
+            flash('登录成功。')
+            return redirect(_safe_next_url(request.form.get('next')))
+        else:
+            flash('用户名或密码错误。')
+    return render_template('login.html', next_url=next_url)
+
+
+@app.route('/logout')
+def logout():
+    """Logout current user and redirect to login page."""
+
+    session.pop(SESSION_KEY, None)
+    flash('已退出登录。')
+    return redirect(url_for('login'))
+
+
 @app.route('/')
+@login_required
 def index():
     """首页：显示最近一次运行结果和最近日志"""
     logs = load_logs()
@@ -850,6 +1014,7 @@ def index():
 
 
 @app.route('/run', methods=['POST'])
+@login_required
 def run_now():
     """手动触发任务"""
     process_emails()
@@ -858,12 +1023,24 @@ def run_now():
 
 
 @app.route('/config', methods=['GET', 'POST'])
+@login_required
 def config_page():
     """配置页面：显示或保存配置"""
     config = load_config()
     mailboxes = config.get('available_mailboxes', [])
     if request.method == 'POST':
         action = request.form.get('action', 'save')
+        if action == 'update_password':
+            new_password = (request.form.get('new_password') or '').strip()
+            confirm_password = (request.form.get('confirm_password') or '').strip()
+            if not new_password:
+                flash('新密码不能为空。')
+            elif new_password != confirm_password:
+                flash('两次输入的密码不一致。')
+            else:
+                set_auth_password(new_password, config=config)
+                flash('登录密码已更新。')
+            return redirect(url_for('config_page'))
         # 保存用户提交的配置
         mail_protocol = request.form.get('mail_protocol', 'imap').strip().lower()
         if mail_protocol not in {'imap', 'pop3'}:
@@ -940,6 +1117,7 @@ def config_page():
 
 
 @app.route('/logs')
+@login_required
 def logs_page():
     """日志页面：查看全部日志"""
     logs = load_logs()
@@ -970,9 +1148,17 @@ def get_runtime_port(default: int = 6006) -> int:
 
 
 if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description='邮件汇总系统后台服务')
+    parser.add_argument('--pwd', dest='default_password', help='email_owner 用户默认密码')
+    args = parser.parse_args()
+
+    initialize_auth(args.default_password)
+
     # 开启定时任务
     start_scheduler()
     # 启动 Flask
     host = os.environ.get('APP_HOST', '0.0.0.0')
     port = get_runtime_port()
     app.run(host=host, port=port)
+else:
+    initialize_auth(None)

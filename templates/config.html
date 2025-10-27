@@ -13,6 +13,10 @@
       <a href="{{ url_for('index') }}">首页</a> |
       <a href="{{ url_for('config_page') }}">配置</a> |
       <a href="{{ url_for('logs_page') }}">日志</a>
+      {% if current_user %}
+      | <span class="user-info">当前用户：{{ current_user }}</span>
+      | <a href="{{ url_for('logout') }}">退出</a>
+      {% endif %}
     </nav>
   </header>
   <main>
@@ -106,6 +110,21 @@
         {% endif %}
       </div>
     </form>
+    <section class="auth-settings">
+      <h2>登录密码管理</h2>
+      <p class="hint">修改后立即生效，与启动参数 <code>--pwd</code> 无关。</p>
+      <form method="post" class="auth-form inline">
+        <label>新密码
+          <input type="password" name="new_password" required>
+        </label>
+        <label>确认新密码
+          <input type="password" name="confirm_password" required>
+        </label>
+        <div class="form-actions">
+          <button type="submit" name="action" value="update_password">更新密码</button>
+        </div>
+      </form>
+    </section>
   </main>
   <footer>
     <p>&copy; 2025 邮件汇总系统</p>

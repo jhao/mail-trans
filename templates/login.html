@@ -1,0 +1,33 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>邮件汇总系统 - 登录</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+  <main class="auth-container">
+    <h1>登录邮件汇总系统</h1>
+    {% with messages = get_flashed_messages() %}
+      {% if messages %}
+        <ul class="flash-messages">
+        {% for message in messages %}
+          <li>{{ message }}</li>
+        {% endfor %}
+        </ul>
+      {% endif %}
+    {% endwith %}
+    <form method="post" class="auth-form">
+      <label>用户名
+        <input type="text" name="username" value="email_owner" readonly>
+      </label>
+      <label>密码
+        <input type="password" name="password" required>
+      </label>
+      <input type="hidden" name="next" value="{{ next_url }}">
+      <button type="submit">登录</button>
+    </form>
+  </main>
+</body>
+</html>
