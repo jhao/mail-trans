@@ -38,9 +38,21 @@
       {% else %}
         <p>暂时没有运行记录。</p>
       {% endif %}
+      <p><strong>定时规则：</strong>{{ schedule_description }}</p>
+      <p><strong>下一次预计执行时间：</strong>{{ next_run_time if next_run_time else '尚未排程' }}</p>
       <form action="{{ url_for('run_now') }}" method="post">
         <button type="submit">立即执行任务</button>
       </form>
+    </section>
+    <section>
+      <h2>任务队列</h2>
+      <p>
+        待处理：{{ queue_stats.pending }} |
+        处理中：{{ queue_stats.processing }} |
+        已完成：{{ queue_stats.done }} |
+        失败：{{ queue_stats.failed }}
+      </p>
+      <p>队列总数：{{ queue_stats.total }}</p>
     </section>
     <section>
       <h2>最近日志</h2>
