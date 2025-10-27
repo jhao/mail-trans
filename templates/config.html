@@ -31,6 +31,36 @@
     {% endwith %}
     <form method="post" class="config-form">
       {% set current_protocol = (config.get('mail_protocol') or 'imap').lower() %}
+      <h2>任务调度</h2>
+      <p class="hint">配置后台任务的执行频率，支持按分钟、按天或指定整点。</p>
+      {% set schedule_mode = schedule_state.get('mode') %}
+      <label>执行模式：
+        <select name="schedule_mode" id="schedule-mode">
+          <option value="minutes" {% if schedule_mode == 'minutes' %}selected{% endif %}>每隔指定分钟执行</option>
+          <option value="days" {% if schedule_mode == 'days' %}selected{% endif %}>每隔指定天执行</option>
+          <option value="fixed_hours" {% if schedule_mode == 'fixed_hours' %}selected{% endif %}>每日指定整点执行</option>
+        </select>
+      </label>
+      <div class="schedule-field schedule-minutes">
+        <label>间隔分钟：
+          <input type="number" name="schedule_interval_minutes" min="1" value="{{ schedule_state.get('minutes', 60) }}">
+        </label>
+      </div>
+      <div class="schedule-field schedule-days">
+        <label>间隔天数：
+          <input type="number" name="schedule_interval_days" min="1" value="{{ schedule_state.get('days', 1) }}">
+        </label>
+        <label>每日执行时间：
+          <input type="time" name="schedule_daily_time" value="{{ schedule_state.get('time', '09:00') }}">
+        </label>
+      </div>
+      <div class="schedule-field schedule-hours">
+        <label>执行整点（逗号分隔 0-23）：
+          <input type="text" name="schedule_fixed_hours" value="{{ config.get('schedule_fixed_hours') or schedule_hours_display }}">
+        </label>
+      </div>
+      <p class="hint">当前规则：{{ schedule_description }}；下一次执行：{{ next_run_time if next_run_time else '尚未排程' }}</p>
+
       <h2>邮件接收协议</h2>
       <label>选择协议：
         <select name="mail_protocol">
@@ -138,6 +168,22 @@
     window.addEventListener('DOMContentLoaded', function () {
       const defaultImapId = {{ default_imap_id | tojson }};
       const restoreButton = document.getElementById('restore-imap-id-defaults');
+      const scheduleModeSelect = document.getElementById('schedule-mode');
+      const scheduleFields = {
+        minutes: document.querySelector('.schedule-minutes'),
+        days: document.querySelector('.schedule-days'),
+        fixed_hours: document.querySelector('.schedule-hours'),
+      };
+
+      function updateScheduleFields() {
+        const mode = scheduleModeSelect ? scheduleModeSelect.value : 'minutes';
+        Object.entries(scheduleFields).forEach(([key, element]) => {
+          if (element) {
+            element.style.display = key === mode ? 'block' : 'none';
+          }
+        });
+      }
+
       if (restoreButton) {
         restoreButton.addEventListener('click', function () {
           const mappings = {
@@ -153,6 +199,11 @@
             }
           });
         });
+      }
+
+      if (scheduleModeSelect) {
+        scheduleModeSelect.addEventListener('change', updateScheduleFields);
+        updateScheduleFields();
       }
     });
   </script>

@@ -5,11 +5,16 @@ import re
 import base64
 import argparse
 import hashlib
+import sqlite3
+import threading
 from functools import wraps
-from datetime import datetime
+from datetime import datetime, timedelta, time
 from urllib.parse import urlparse
 from flask import Flask, render_template, request, redirect, url_for, flash, session
 from apscheduler.schedulers.background import BackgroundScheduler
+from apscheduler.jobstores.base import JobLookupError
+from apscheduler.triggers.interval import IntervalTrigger
+from apscheduler.triggers.cron import CronTrigger
 import imaplib
 import poplib
 import smtplib
@@ -39,6 +44,19 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(mess
 
 CONFIG_FILE = os.path.join(os.path.dirname(__file__), 'config.json')
 LOG_FILE = os.path.join(os.path.dirname(__file__), 'logs.json')
+QUEUE_DB_FILE = os.path.join(os.path.dirname(__file__), 'queue.db')
+
+SCHEDULER_JOB_ID = "process_emails_job"
+QUEUE_WORKER_JOB_ID = "queue_worker_job"
+QUEUE_BATCH_LIMIT = 1
+QUEUE_MAX_ATTEMPTS = 3
+QUEUE_CONFIG_WARNING_INTERVAL = timedelta(minutes=5)
+
+CONFIG_LOCK = threading.Lock()
+LOG_LOCK = threading.Lock()
+
+SCHEDULER: BackgroundScheduler | None = None
+LAST_QUEUE_CONFIG_WARNING: datetime | None = None
 
 DEFAULT_IMAP_ID = {
     'name': 'Apple Mail',
@@ -54,6 +72,28 @@ UNSAFE_PORTS = {
     548, 556, 563, 587, 601, 636, 993, 995, 2049, 3659, 4045, 6000, 6665, 6666,
     6667, 6668, 6669, 6697, 10080,
 }
+
+MAIL_COMMON_REQUIRED = [
+    'smtp_host',
+    'smtp_port',
+    'smtp_user',
+    'smtp_pass',
+    'forward_email',
+    'senders',
+    'deepseek_token',
+]
+
+MAIL_IMAP_REQUIRED = ['imap_host', 'imap_port', 'imap_user', 'imap_pass']
+MAIL_POP3_REQUIRED = ['pop3_host', 'pop3_port', 'pop3_user', 'pop3_pass']
+
+QUEUE_REQUIRED_FIELDS = [
+    'smtp_host',
+    'smtp_port',
+    'smtp_user',
+    'smtp_pass',
+    'forward_email',
+    'deepseek_token',
+]
 
 DEEPSEEK_CHAT_COMPLETIONS_URL = "https://api.deepseek.com/v1/chat/completions"
 DEFAULT_DEEPSEEK_TIMEOUT = 120
@@ -467,11 +507,8 @@ def _extract_email_body(msg: email.message.Message) -> str:
 def _parse_email_message(
     msg: email.message.Message,
     sender_list: list[str],
-    deepseek_token: str,
-    *,
-    deepseek_timeout: float,
 ) -> dict[str, str] | None:
-    """解析邮件对象并根据发件人筛选返回处理结果。"""
+    """解析邮件对象并根据发件人筛选返回基础信息。"""
 
     subject = _decode_header_value(msg.get("Subject"))
     from_ = _decode_header_value(msg.get("From"))
@@ -494,49 +531,523 @@ def _parse_email_message(
         logging.debug("邮件 %s 未能提取正文，跳过。", subject or '(无主题)')
         return None
 
-    chinese = deepseek_translate(body, deepseek_token, timeout=deepseek_timeout)
-    summary = deepseek_summarize(chinese, deepseek_token, timeout=deepseek_timeout)
     return {
         "subject": subject,
         "from": from_,
         "original": body,
-        "chinese": chinese,
-        "summary": summary,
     }
 
 
 def load_config():
     """读取配置文件，不存在则返回空字典"""
-    if os.path.exists(CONFIG_FILE):
-        with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
-            try:
-                return json.load(f)
-            except Exception:
-                return {}
-    return {}
+    with CONFIG_LOCK:
+        if os.path.exists(CONFIG_FILE):
+            with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
+                try:
+                    return json.load(f)
+                except Exception:
+                    return {}
+        return {}
 
 
 def save_config(config: dict) -> None:
     """保存配置到文件"""
-    with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
-        json.dump(config, f, ensure_ascii=False, indent=2)
+    with CONFIG_LOCK:
+        with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
+            json.dump(config, f, ensure_ascii=False, indent=2)
 
 
 def load_logs():
     """读取日志文件，返回列表"""
-    if os.path.exists(LOG_FILE):
-        with open(LOG_FILE, 'r', encoding='utf-8') as f:
-            try:
-                return json.load(f)
-            except Exception:
-                return []
-    return []
+    with LOG_LOCK:
+        if os.path.exists(LOG_FILE):
+            with open(LOG_FILE, 'r', encoding='utf-8') as f:
+                try:
+                    return json.load(f)
+                except Exception:
+                    return []
+        return []
 
 
 def save_logs(logs: list) -> None:
     """保存日志到文件"""
-    with open(LOG_FILE, 'w', encoding='utf-8') as f:
-        json.dump(logs, f, ensure_ascii=False, indent=2)
+    with LOG_LOCK:
+        with open(LOG_FILE, 'w', encoding='utf-8') as f:
+            json.dump(logs, f, ensure_ascii=False, indent=2)
+
+
+def append_log_entry(message: str, success: bool) -> None:
+    """追加单条日志记录。"""
+
+    logs = load_logs()
+    logs.append(
+        {
+            "time": datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+            "success": success,
+            "message": message,
+        }
+    )
+    save_logs(logs)
+
+
+def init_queue_storage() -> None:
+    """初始化任务队列存储。"""
+
+    with sqlite3.connect(QUEUE_DB_FILE) as conn:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS task_queue (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                payload TEXT NOT NULL,
+                status TEXT NOT NULL,
+                trigger TEXT,
+                attempts INTEGER NOT NULL DEFAULT 0,
+                last_error TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.commit()
+
+
+def enqueue_email_batch(emails: list[dict[str, str]], trigger: str) -> int:
+    """将邮件集合加入任务队列，返回任务 ID。"""
+
+    if not emails:
+        raise ValueError("邮件列表为空，无法创建任务。")
+    now_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    payload = json.dumps({"emails": emails}, ensure_ascii=False)
+    with sqlite3.connect(QUEUE_DB_FILE) as conn:
+        cursor = conn.execute(
+            """
+            INSERT INTO task_queue (payload, status, trigger, attempts, created_at, updated_at)
+            VALUES (?, 'pending', ?, 0, ?, ?)
+            """,
+            (payload, trigger, now_str, now_str),
+        )
+        conn.commit()
+        return int(cursor.lastrowid)
+
+
+def _finalize_task(task_id: int, status: str, *, last_error: str | None = None) -> None:
+    """更新任务状态。"""
+
+    now_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    with sqlite3.connect(QUEUE_DB_FILE) as conn:
+        conn.execute(
+            """
+            UPDATE task_queue
+            SET status = ?, last_error = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            (status, last_error, now_str, task_id),
+        )
+        conn.commit()
+
+
+def _reset_task(task_id: int, *, last_error: str | None = None) -> None:
+    """将任务恢复为待处理状态。"""
+
+    now_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    with sqlite3.connect(QUEUE_DB_FILE) as conn:
+        conn.execute(
+            """
+            UPDATE task_queue
+            SET status = 'pending', last_error = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            (last_error, now_str, task_id),
+        )
+        conn.commit()
+
+
+def claim_pending_tasks(limit: int) -> list[dict[str, object]]:
+    """领取待处理的队列任务并标记为处理中。"""
+
+    now_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    claimed: list[dict[str, object]] = []
+    with sqlite3.connect(QUEUE_DB_FILE) as conn:
+        conn.row_factory = sqlite3.Row
+        pending = conn.execute(
+            "SELECT id FROM task_queue WHERE status = 'pending' ORDER BY id LIMIT ?",
+            (limit,),
+        ).fetchall()
+        for row in pending:
+            cursor = conn.execute(
+                """
+                UPDATE task_queue
+                SET status = 'processing', attempts = attempts + 1, updated_at = ?
+                WHERE id = ? AND status = 'pending'
+                """,
+                (now_str, row['id']),
+            )
+            if cursor.rowcount:
+                task_row = conn.execute(
+                    "SELECT id, payload, trigger, attempts FROM task_queue WHERE id = ?",
+                    (row['id'],),
+                ).fetchone()
+                if task_row:
+                    claimed.append(dict(task_row))
+        conn.commit()
+    return claimed
+
+
+def get_queue_statistics() -> dict[str, int]:
+    """返回当前队列的状态统计。"""
+
+    stats = {"pending": 0, "processing": 0, "done": 0, "failed": 0}
+    with sqlite3.connect(QUEUE_DB_FILE) as conn:
+        for status, count in conn.execute(
+            "SELECT status, COUNT(1) FROM task_queue GROUP BY status"
+        ):
+            stats[str(status)] = int(count)
+    stats["total"] = sum(stats.values())
+    return stats
+
+
+def _resolve_deepseek_timeout(config: dict) -> float:
+    """解析 DeepSeek 超时时间配置。"""
+
+    raw = config.get('deepseek_timeout')
+    if raw is None or raw == "":
+        return DEFAULT_DEEPSEEK_TIMEOUT
+    try:
+        value = float(raw)
+        if value > 0:
+            return value
+    except (TypeError, ValueError):
+        logging.warning(
+            "DeepSeek 超时时间配置无效：%s，使用默认值 %s 秒。",
+            raw,
+            DEFAULT_DEEPSEEK_TIMEOUT,
+        )
+    return DEFAULT_DEEPSEEK_TIMEOUT
+
+
+def _send_summary_email(
+    processed_emails: list[dict[str, str]],
+    smtp_host: str,
+    smtp_port: int,
+    smtp_user: str,
+    smtp_pass: str,
+    forward_email: str,
+) -> None:
+    """构建并发送汇总邮件。"""
+
+    if not processed_emails:
+        return
+    message = MIMEMultipart("alternative")
+    message["Subject"] = "自动汇总邮件"
+    message["From"] = smtp_user
+    message["To"] = forward_email
+
+    html = ["<html><body>"]
+    html.append("<h2>邮件目录</h2>")
+    html.append("<ul>")
+    for idx, item in enumerate(processed_emails, start=1):
+        anchor = f"email{idx}"
+        summary = item.get("summary", "")
+        short_summary = summary[:100]
+        subject = item.get("subject", "(无主题)")
+        html.append(
+            f'<li><a href="#{anchor}">{subject}</a> - {short_summary}</li>'
+        )
+    html.append("</ul><hr/>")
+    for idx, item in enumerate(processed_emails, start=1):
+        anchor = f"email{idx}"
+        subject = item.get("subject", "(无主题)")
+        from_ = item.get("from", "")
+        chinese = item.get("chinese", "").replace('\n', '<br/>')
+        html.append(f'<h3 id="{anchor}">{subject}</h3>')
+        html.append(f'<p><strong>发件人:</strong> {from_}</p>')
+        html.append(f'<p>{chinese}</p>')
+        html.append("<hr/>")
+    html.append("</body></html>")
+
+    part = MIMEText("".join(html), "html", "utf-8")
+    message.attach(part)
+
+    server = smtplib.SMTP_SSL(smtp_host, smtp_port)
+    try:
+        server.login(smtp_user, smtp_pass)
+        server.sendmail(smtp_user, [forward_email], message.as_string())
+    finally:
+        try:
+            server.quit()
+        except Exception:
+            pass
+
+
+def process_task_queue(batch_size: int = QUEUE_BATCH_LIMIT) -> None:
+    """异步处理队列中的邮件翻译与转发任务。"""
+
+    global LAST_QUEUE_CONFIG_WARNING
+
+    tasks = claim_pending_tasks(batch_size)
+    if not tasks:
+        return
+
+    config = load_config()
+    missing = [field for field in QUEUE_REQUIRED_FIELDS if not config.get(field)]
+    if missing:
+        now = datetime.now()
+        if (
+            LAST_QUEUE_CONFIG_WARNING is None
+            or now - LAST_QUEUE_CONFIG_WARNING >= QUEUE_CONFIG_WARNING_INTERVAL
+        ):
+            append_log_entry(
+                f"队列任务无法执行，缺少配置字段：{', '.join(missing)}",
+                False,
+            )
+            LAST_QUEUE_CONFIG_WARNING = now
+        for task in tasks:
+            _reset_task(int(task['id']), last_error='配置缺失，等待重试')
+        return
+
+    smtp_host = config.get('smtp_host')
+    smtp_port = int(config.get('smtp_port', 465))
+    smtp_user = config.get('smtp_user')
+    smtp_pass = config.get('smtp_pass')
+    forward_email = config.get('forward_email')
+    deepseek_token = config.get('deepseek_token')
+    deepseek_timeout = _resolve_deepseek_timeout(config)
+
+    for task in tasks:
+        task_id = int(task['id'])
+        attempts = int(task.get('attempts', 0))
+        try:
+            payload = json.loads(task['payload'])
+        except (TypeError, ValueError) as exc:
+            append_log_entry(
+                f"队列任务 #{task_id} 数据解析失败：{exc}",
+                False,
+            )
+            _finalize_task(task_id, 'failed', last_error='数据解析失败')
+            continue
+
+        emails = payload.get('emails') if isinstance(payload, dict) else None
+        if not emails:
+            _finalize_task(task_id, 'done')
+            append_log_entry(
+                f"队列任务 #{task_id} 无需处理的邮件，已标记完成。",
+                True,
+            )
+            continue
+
+        processed_emails: list[dict[str, str]] = []
+        for email_entry in emails:
+            subject = email_entry.get('subject') or '(无主题)'
+            from_ = email_entry.get('from') or ''
+            original = email_entry.get('original') or ''
+            chinese = deepseek_translate(original, deepseek_token, timeout=deepseek_timeout)
+            summary = deepseek_summarize(chinese, deepseek_token, timeout=deepseek_timeout)
+            processed_emails.append(
+                {
+                    'subject': subject,
+                    'from': from_,
+                    'chinese': chinese,
+                    'summary': summary,
+                }
+            )
+
+        try:
+            _send_summary_email(
+                processed_emails,
+                smtp_host,
+                smtp_port,
+                smtp_user,
+                smtp_pass,
+                forward_email,
+            )
+        except Exception as exc:
+            logging.exception("队列任务 #%s 转发失败", task_id, exc_info=exc)
+            if attempts >= QUEUE_MAX_ATTEMPTS:
+                _finalize_task(task_id, 'failed', last_error=str(exc))
+                append_log_entry(
+                    f"队列任务 #{task_id} 达到最大重试次数，已标记失败：{exc}",
+                    False,
+                )
+            else:
+                _reset_task(task_id, last_error=str(exc))
+            continue
+
+        _finalize_task(task_id, 'done')
+        append_log_entry(
+            f"队列任务 #{task_id} 已完成，成功转发 {len(processed_emails)} 封邮件。",
+            True,
+        )
+
+
+def _normalize_schedule_config(config: dict | None = None) -> dict[str, object]:
+    """整理调度配置，返回规范化结果。"""
+
+    config = config or load_config()
+    mode = str(config.get('schedule_mode') or 'minutes').lower()
+    if mode not in {'minutes', 'days', 'fixed_hours'}:
+        mode = 'minutes'
+    normalized: dict[str, object] = {'mode': mode}
+    if mode == 'minutes':
+        minutes_raw = str(config.get('schedule_interval_minutes') or '').strip()
+        try:
+            minutes = int(minutes_raw)
+        except ValueError:
+            minutes = 60
+        if minutes <= 0:
+            minutes = 60
+        normalized['minutes'] = minutes
+    elif mode == 'days':
+        days_raw = str(config.get('schedule_interval_days') or '').strip()
+        try:
+            days = int(days_raw)
+        except ValueError:
+            days = 1
+        if days <= 0:
+            days = 1
+        time_raw = str(config.get('schedule_daily_time') or '09:00').strip()
+        try:
+            hour_str, minute_str = time_raw.split(':', 1)
+            hour = int(hour_str)
+            minute = int(minute_str)
+        except ValueError:
+            hour, minute = 9, 0
+        hour = max(0, min(23, hour))
+        minute = max(0, min(59, minute))
+        normalized['days'] = days
+        normalized['time'] = f"{hour:02d}:{minute:02d}"
+    else:
+        hours_raw = str(config.get('schedule_fixed_hours') or '')
+        hours: list[int] = []
+        for token in hours_raw.split(','):
+            token = token.strip()
+            if not token:
+                continue
+            try:
+                value = int(token)
+            except ValueError:
+                continue
+            if 0 <= value <= 23:
+                hours.append(value)
+        hours = sorted(set(hours))
+        if not hours:
+            hours = [9]
+        normalized['hours'] = hours
+    return normalized
+
+
+def _build_schedule_trigger(
+    config: dict | None = None,
+) -> tuple[IntervalTrigger | CronTrigger, dict[str, object]]:
+    """根据配置生成 APScheduler Trigger。"""
+
+    normalized = _normalize_schedule_config(config)
+    mode = normalized['mode']
+    if mode == 'minutes':
+        trigger = IntervalTrigger(minutes=int(normalized['minutes']))
+    elif mode == 'days':
+        days = int(normalized['days'])
+        hour_str, minute_str = str(normalized['time']).split(':', 1)
+        hour = int(hour_str)
+        minute = int(minute_str)
+        now = datetime.now()
+        start = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+        if start <= now:
+            start += timedelta(days=days)
+        trigger = IntervalTrigger(days=days, start_date=start)
+    else:
+        trigger = CronTrigger(hour=list(normalized['hours']), minute=0)
+    return trigger, normalized
+
+
+def describe_schedule(config: dict | None = None) -> str:
+    """返回人类可读的调度描述。"""
+
+    normalized = _normalize_schedule_config(config)
+    mode = normalized['mode']
+    if mode == 'minutes':
+        return f"每 {normalized['minutes']} 分钟执行一次"
+    if mode == 'days':
+        return f"每 {normalized['days']} 天在 {normalized['time']} 执行"
+    hours = ', '.join(f"{hour:02d}:00" for hour in normalized['hours'])
+    return f"每日 {hours} 执行"
+
+
+def format_datetime(dt: datetime | None) -> str | None:
+    """格式化日期时间用于展示。"""
+
+    if dt is None:
+        return None
+    if dt.tzinfo is not None:
+        dt = dt.astimezone()
+    return dt.strftime('%Y-%m-%d %H:%M:%S')
+
+
+def get_next_run_time() -> datetime | None:
+    """读取调度任务的下一次执行时间。"""
+
+    if SCHEDULER is None:
+        return None
+    job = SCHEDULER.get_job(SCHEDULER_JOB_ID)
+    if job is None:
+        return None
+    return job.next_run_time
+
+
+def refresh_scheduler_job(*, config: dict | None = None) -> None:
+    """根据配置刷新定时任务。"""
+
+    if SCHEDULER is None:
+        return
+    trigger, _ = _build_schedule_trigger(config or load_config())
+    try:
+        SCHEDULER.remove_job(SCHEDULER_JOB_ID)
+    except JobLookupError:
+        pass
+    SCHEDULER.add_job(
+        process_emails,
+        trigger=trigger,
+        args=('scheduler',),
+        id=SCHEDULER_JOB_ID,
+        replace_existing=True,
+        coalesce=True,
+        max_instances=1,
+    )
+
+
+def ensure_queue_worker_job() -> None:
+    """确保队列轮询任务已注册。"""
+
+    if SCHEDULER is None:
+        return
+    if SCHEDULER.get_job(QUEUE_WORKER_JOB_ID) is None:
+        SCHEDULER.add_job(
+            run_queue_worker,
+            trigger=IntervalTrigger(seconds=10),
+            id=QUEUE_WORKER_JOB_ID,
+            coalesce=True,
+            max_instances=1,
+        )
+
+
+def run_queue_worker() -> None:
+    """后台执行队列任务。"""
+
+    try:
+        process_task_queue()
+    except Exception:
+        logging.exception("后台队列任务执行失败")
+
+
+def start_scheduler() -> None:
+    """启动或刷新调度器。"""
+
+    global SCHEDULER
+
+    if SCHEDULER is None:
+        SCHEDULER = BackgroundScheduler()
+        SCHEDULER.start()
+    refresh_scheduler_job()
+    ensure_queue_worker_job()
 
 
 def _call_deepseek_chat(
@@ -719,61 +1230,37 @@ def fetch_imap_mailboxes(
             pass
 
 
-def process_emails():
-    """核心任务：读取邮件、翻译、汇总并转发"""
-    config = load_config()
-    logs = load_logs()
 
-    timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-    log_entry = {"time": timestamp, "success": False, "message": ""}
+    
+def _trigger_label(trigger: str) -> str:
+    """转换任务来源标签。"""
+
+    return {'manual': '手动', 'scheduler': '定时', 'queue': '队列'}.get(trigger, trigger)
+
+
+def process_emails(trigger: str = 'scheduler') -> str:
+    """核心任务：读取邮件并入队等待异步处理。"""
+
+    config = load_config()
+    trigger_label = _trigger_label(trigger)
 
     mail_protocol = str(config.get('mail_protocol') or 'imap').lower()
     if mail_protocol not in {'imap', 'pop3'}:
         mail_protocol = 'imap'
 
-    common_required = [
-        'smtp_host', 'smtp_port', 'smtp_user', 'smtp_pass',
-        'forward_email', 'senders', 'deepseek_token'
-    ]
-    protocol_required = [
-        'imap_host', 'imap_port', 'imap_user', 'imap_pass'
-    ] if mail_protocol == 'imap' else [
-        'pop3_host', 'pop3_port', 'pop3_user', 'pop3_pass'
-    ]
-    required_fields = protocol_required + common_required
+    required_fields = (
+        (MAIL_IMAP_REQUIRED if mail_protocol == 'imap' else MAIL_POP3_REQUIRED)
+        + MAIL_COMMON_REQUIRED
+    )
     missing_fields = [field for field in required_fields if not config.get(field)]
     if missing_fields:
-        logging.error("任务配置缺失字段：%s", ', '.join(missing_fields))
-        log_entry['message'] = f"配置项缺失：{', '.join(missing_fields)}。请在配置页面完善。"
-        logs.append(log_entry)
-        save_logs(logs)
-        return
-    logging.debug("所有必要配置均已填写。")
+        message = f"{trigger_label}任务无法执行，缺少配置字段：{', '.join(missing_fields)}"
+        append_log_entry(message, False)
+        return message
 
-    smtp_host = config.get('smtp_host')
-    smtp_port = int(config.get('smtp_port', 465))
-    smtp_user = config.get('smtp_user')
-    smtp_pass = config.get('smtp_pass')
-    forward_email = config.get('forward_email')
-    sender_list = [s.strip() for s in config.get('senders', '').split(',') if s.strip()]
-    deepseek_token = config.get('deepseek_token')
-    deepseek_timeout_raw = config.get('deepseek_timeout')
-    deepseek_timeout = DEFAULT_DEEPSEEK_TIMEOUT
-    if deepseek_timeout_raw:
-        try:
-            deepseek_timeout = float(deepseek_timeout_raw)
-            if deepseek_timeout <= 0:
-                raise ValueError
-        except (TypeError, ValueError):
-            logging.warning(
-                "DeepSeek 超时时间配置无效：%s，使用默认值 %s 秒。",
-                deepseek_timeout_raw,
-                DEFAULT_DEEPSEEK_TIMEOUT,
-            )
-            deepseek_timeout = DEFAULT_DEEPSEEK_TIMEOUT
-    logging.debug("DeepSeek 请求超时时间设定为 %s 秒。", deepseek_timeout)
+    sender_list = [s.strip() for s in str(config.get('senders', '')).split(',') if s.strip()]
+    pending_emails: list[dict[str, str]] = []
 
-    processed_emails: list[dict[str, str]] = []
     try:
         if mail_protocol == 'pop3':
             pop_host = config.get('pop3_host')
@@ -843,14 +1330,9 @@ def process_emails():
                     processed_this_run.append(normalized_uidl)
                     msg_content = b"\r\n".join(lines)
                     msg = email.message_from_bytes(msg_content)
-                    parsed = _parse_email_message(
-                        msg,
-                        sender_list,
-                        deepseek_token,
-                        deepseek_timeout=deepseek_timeout,
-                    )
+                    parsed = _parse_email_message(msg, sender_list)
                     if parsed:
-                        processed_emails.append(parsed)
+                        pending_emails.append(parsed)
 
                 if processed_this_run:
                     for uidl in processed_this_run:
@@ -878,9 +1360,7 @@ def process_emails():
             mail: imaplib.IMAP4 | None = None
             try:
                 mail = imaplib.IMAP4_SSL(imap_host, imap_port)
-                mail.login(imap_user, imap_pass)
                 _send_imap_id(mail, imap_id_params)
-                encoded_mailbox = target_mailbox
                 try:
                     encoded_mailbox = _imap_encode_utf7(target_mailbox)
                     if encoded_mailbox != target_mailbox:
@@ -951,72 +1431,37 @@ def process_emails():
                     if res != 'OK':
                         continue
                     msg = email.message_from_bytes(data[0][1])
-                    parsed = _parse_email_message(
-                        msg,
-                        sender_list,
-                        deepseek_token,
-                        deepseek_timeout=deepseek_timeout,
-                    )
+                    parsed = _parse_email_message(msg, sender_list)
                     if parsed:
-                        processed_emails.append(parsed)
+                        pending_emails.append(parsed)
             finally:
                 if mail:
                     try:
                         mail.logout()
                     except Exception:
                         pass
-    except Exception as e:
-        log_entry['message'] = f"处理邮件出现异常: {str(e)}"
-        logs.append(log_entry)
-        save_logs(logs)
-        return
+    except Exception as exc:
+        message = f"{trigger_label}任务处理邮件出现异常: {exc}"
+        logging.exception("邮件抓取过程失败", exc_info=exc)
+        append_log_entry(message, False)
+        return message
 
-    # 如果有处理到邮件则发送汇总邮件
-    if processed_emails:
-        try:
-            message = MIMEMultipart("alternative")
-            message["Subject"] = "自动汇总邮件"
-            message["From"] = smtp_user
-            message["To"] = forward_email
-            # 构建 HTML
-            html = "<html><body>"
-            html += "<h2>邮件目录</h2>"
-            html += "<ul>"
-            for idx, itm in enumerate(processed_emails, start=1):
-                anchor = f"email{idx}"
-                summary = itm["summary"]
-                # 截取概述前 100 个字符
-                short_summary = summary[:100]
-                html += f'<li><a href="#{anchor}">{itm["subject"]}</a> - {short_summary}</li>'
-            html += "</ul><hr/>"
-            for idx, itm in enumerate(processed_emails, start=1):
-                anchor = f"email{idx}"
-                html += f'<h3 id="{anchor}">{itm["subject"]}</h3>'
-                html += f'<p><strong>发件人:</strong> {itm["from"]}</p>'
-                # 将换行替换成 <br/>
-                body_html = itm["chinese"].replace('\n', '<br/>')
-                html += f'<p>{body_html}</p>'
-                html += "<hr/>"
-            html += "</body></html>"
-            part = MIMEText(html, "html", "utf-8")
-            message.attach(part)
-            # 发送邮件
-            server = smtplib.SMTP_SSL(smtp_host, smtp_port)
-            server.login(smtp_user, smtp_pass)
-            server.sendmail(smtp_user, [forward_email], message.as_string())
-            server.quit()
-            log_entry['success'] = True
-            log_entry['message'] = f"成功处理 {len(processed_emails)} 封邮件并转发。"
-        except Exception as e:
-            log_entry['success'] = False
-            log_entry['message'] = f"转发邮件失败: {str(e)}"
-    else:
-        # 没有符合条件的邮件
-        log_entry['success'] = True
-        log_entry['message'] = "没有符合条件的未读邮件。"
+    if not pending_emails:
+        message = f"{trigger_label}任务执行完毕，没有符合条件的未读邮件。"
+        append_log_entry(message, True)
+        return message
 
-    logs.append(log_entry)
-    save_logs(logs)
+    try:
+        task_id = enqueue_email_batch(pending_emails, trigger)
+    except Exception as exc:
+        logging.exception("创建队列任务失败", exc_info=exc)
+        message = f"{trigger_label}任务发现 {len(pending_emails)} 封邮件但创建队列失败：{exc}"
+        append_log_entry(message, False)
+        return message
+
+    message = f"{trigger_label}任务检测到 {len(pending_emails)} 封未读邮件，已创建队列任务 #{task_id}。"
+    append_log_entry(message, True)
+    return message
 
 
 @app.route('/login', methods=['GET', 'POST'])
@@ -1061,15 +1506,25 @@ def index():
     last_run = logs[-1] if logs else None
     # 仅展示最近 10 条
     recent_logs = logs[-10:]
-    return render_template('index.html', last_run=last_run, logs=recent_logs)
+    queue_stats = get_queue_statistics()
+    next_run_display = format_datetime(get_next_run_time())
+    schedule_desc = describe_schedule()
+    return render_template(
+        'index.html',
+        last_run=last_run,
+        logs=recent_logs,
+        queue_stats=queue_stats,
+        next_run_time=next_run_display,
+        schedule_description=schedule_desc,
+    )
 
 
 @app.route('/run', methods=['POST'])
 @login_required
 def run_now():
     """手动触发任务"""
-    process_emails()
-    flash("任务已执行。")
+    message = process_emails('manual')
+    flash(message or "任务已执行。")
     return redirect(url_for('index'))
 
 
@@ -1079,6 +1534,12 @@ def config_page():
     """配置页面：显示或保存配置"""
     config = load_config()
     mailboxes = config.get('available_mailboxes', [])
+    schedule_state = _normalize_schedule_config(config)
+    schedule_hours_display = ','.join(
+        f"{hour:02d}" for hour in schedule_state.get('hours', [])
+    )
+    next_run_display = format_datetime(get_next_run_time())
+    schedule_desc = describe_schedule(config)
     if request.method == 'POST':
         action = request.form.get('action', 'save')
         if action == 'update_password':
@@ -1097,6 +1558,10 @@ def config_page():
         if mail_protocol not in {'imap', 'pop3'}:
             mail_protocol = 'imap'
         config['mail_protocol'] = mail_protocol
+        schedule_mode = (request.form.get('schedule_mode') or 'minutes').strip().lower()
+        if schedule_mode not in {'minutes', 'days', 'fixed_hours'}:
+            schedule_mode = 'minutes'
+        config['schedule_mode'] = schedule_mode
         config['imap_host'] = request.form.get('imap_host', '').strip()
         config['imap_port'] = request.form.get('imap_port', '').strip()
         config['imap_user'] = request.form.get('imap_user', '').strip()
@@ -1122,10 +1587,28 @@ def config_page():
         timeout_value = request.form.get('deepseek_timeout', '').strip()
         default_timeout_str = f"{DEFAULT_DEEPSEEK_TIMEOUT:g}"
         config['deepseek_timeout'] = timeout_value or default_timeout_str
+        config['schedule_interval_minutes'] = (
+            request.form.get('schedule_interval_minutes', '').strip()
+        )
+        config['schedule_interval_days'] = (
+            request.form.get('schedule_interval_days', '').strip()
+        )
+        config['schedule_daily_time'] = (
+            request.form.get('schedule_daily_time', '').strip()
+        )
+        config['schedule_fixed_hours'] = (
+            request.form.get('schedule_fixed_hours', '').strip()
+        )
 
         if action == 'fetch_mailboxes':
             if config['mail_protocol'] == 'pop3':
                 flash("POP3 协议不支持获取邮箱文件夹列表。")
+                schedule_state = _normalize_schedule_config(config)
+                schedule_hours_display = ','.join(
+                    f"{hour:02d}" for hour in schedule_state.get('hours', [])
+                )
+                schedule_desc = describe_schedule(config)
+                next_run_display = format_datetime(get_next_run_time())
                 return render_template(
                     'config.html',
                     config=config,
@@ -1133,6 +1616,10 @@ def config_page():
                     fetched_mailboxes=None,
                     default_imap_id=DEFAULT_IMAP_ID,
                     deepseek_timeout_default=DEFAULT_DEEPSEEK_TIMEOUT,
+                    schedule_state=schedule_state,
+                    schedule_hours_display=schedule_hours_display,
+                    schedule_description=schedule_desc,
+                    next_run_time=next_run_display,
                 )
             try:
                 id_params = _build_imap_id_params(config)
@@ -1147,9 +1634,16 @@ def config_page():
                 if mailboxes and config['imap_mailbox'] not in mailboxes:
                     config['imap_mailbox'] = ''
                 save_config(config)
+                refresh_scheduler_job(config=config)
                 flash("邮箱验证成功，已获取可用列表。")
             except Exception as exc:
                 flash(f"获取邮箱列表失败：{exc}")
+            schedule_state = _normalize_schedule_config(config)
+            schedule_hours_display = ','.join(
+                f"{hour:02d}" for hour in schedule_state.get('hours', [])
+            )
+            schedule_desc = describe_schedule(config)
+            next_run_display = format_datetime(get_next_run_time())
             return render_template(
                 'config.html',
                 config=config,
@@ -1157,10 +1651,15 @@ def config_page():
                 fetched_mailboxes=mailboxes,
                 default_imap_id=DEFAULT_IMAP_ID,
                 deepseek_timeout_default=DEFAULT_DEEPSEEK_TIMEOUT,
+                schedule_state=schedule_state,
+                schedule_hours_display=schedule_hours_display,
+                schedule_description=schedule_desc,
+                next_run_time=next_run_display,
             )
 
         config['available_mailboxes'] = mailboxes
         save_config(config)
+        refresh_scheduler_job(config=config)
         flash("配置已保存。")
         return redirect(url_for('config_page'))
     return render_template(
@@ -1170,6 +1669,10 @@ def config_page():
         fetched_mailboxes=None,
         default_imap_id=DEFAULT_IMAP_ID,
         deepseek_timeout_default=DEFAULT_DEEPSEEK_TIMEOUT,
+        schedule_state=schedule_state,
+        schedule_hours_display=schedule_hours_display,
+        schedule_description=schedule_desc,
+        next_run_time=next_run_display,
     )
 
 
@@ -1179,13 +1682,6 @@ def logs_page():
     """日志页面：查看全部日志"""
     logs = load_logs()
     return render_template('logs.html', logs=logs)
-
-
-def start_scheduler():
-    """启动后台调度器，每小时运行一次"""
-    scheduler = BackgroundScheduler()
-    scheduler.add_job(process_emails, 'interval', hours=1)
-    scheduler.start()
 
 
 def get_runtime_port(default: int = 6006) -> int:
@@ -1211,6 +1707,7 @@ if __name__ == '__main__':
 
     initialize_auth(args.default_password)
 
+    init_queue_storage()
     # 开启定时任务
     start_scheduler()
     # 启动 Flask
@@ -1219,3 +1716,5 @@ if __name__ == '__main__':
     app.run(host=host, port=port)
 else:
     initialize_auth(None)
+    init_queue_storage()
+    start_scheduler()

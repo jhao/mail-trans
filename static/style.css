@@ -105,6 +105,10 @@ footer {
   margin-bottom: 10px;
 }
 
+.schedule-field {
+  margin-bottom: 10px;
+}
+
 .config-form input[type="text"],
 .config-form input[type="password"],
 .config-form input[type="email"],
