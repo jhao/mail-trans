@@ -14,4 +14,4 @@ COPY . ./
 
 ENV APP_PORT=6006
 
-CMD ["gunicorn", "--bind", "0.0.0.0:${APP_PORT}", "--workers", "2", "--threads", "4", "app:app"]
+CMD ["/bin/sh", "-c", "gunicorn --bind 0.0.0.0:${APP_PORT} --workers 2 --threads 4 app:app"]
