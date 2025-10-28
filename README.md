@@ -120,25 +120,35 @@ Python 应用无需编译，但建议使用 WSGI 服务器托管，并与调度�
    ```
 3. 将上述命令写入 systemd service，确保崩溃后自动重启。
 
-#### 方式二：Docker（示例）
-1. 创建 `Dockerfile`（需自建）：
+#### 方式二：Docker
+1. 使用内置 `Dockerfile`（节选如下），镜像会通过清华大学 PyPI 镜像加速安装依赖，并使用 Gunicorn 作为生产服务：
    ```dockerfile
    FROM python:3.11-slim
+
+   ENV PYTHONUNBUFFERED=1 \
+       PIP_NO_CACHE_DIR=1
+
    WORKDIR /app
-   COPY . /app
-   RUN pip install --no-cache-dir -r requirements.txt
+
+   COPY requirements.txt ./
+   RUN python -m pip install --upgrade pip -i https://pypi.tuna.tsinghua.edu.cn/simple \
+       && python -m pip install --no-cache-dir -i https://pypi.tuna.tsinghua.edu.cn/simple -r requirements.txt
+
+   COPY . ./
+
    ENV APP_PORT=6006
+
    CMD ["gunicorn", "--bind", "0.0.0.0:${APP_PORT}", "--workers", "2", "--threads", "4", "app:app"]
    ```
 2. 构建并运行：
    ```bash
    docker build -t mail-trans .
-  docker run -d --name mail-trans -p 6006:6006 \
-    -e APP_DEFAULT_PASSWORD=<初始密码> \
-    -v $(pwd)/config.json:/app/config.json \
-    -v $(pwd)/logs.json:/app/logs.json \
-    -v $(pwd)/queue.db:/app/queue.db \
-    mail-trans
+   docker run -d --name mail-trans -p 6006:6006 \
+     -e APP_DEFAULT_PASSWORD=<初始密码> \
+     -v $(pwd)/config.json:/app/config.json \
+     -v $(pwd)/logs.json:/app/logs.json \
+     -v $(pwd)/queue.db:/app/queue.db \
+     mail-trans
    ```
    > 若使用 Docker，请确保挂载配置、日志与队列数据库文件，避免容器重建导致数据丢失。
 
