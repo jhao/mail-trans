@@ -97,7 +97,7 @@ python app.py --pwd <初始密码>
 ```
 
 - 应用默认监听 `http://0.0.0.0:6006/`。若需修改端口，可通过环境变量 `APP_PORT`（或 `PORT`）指定；当端口位于浏览器的非安全列表时会自动回退到 6006。
-- 参数 `--pwd` 用于首次启动时初始化 `email_owner` 账号的登录密码，后续可在配置页修改；若未提供且配置中没有密码，系统会拒绝所有登录请求。
+- 首次启动可通过命令行参数 `--pwd` 或环境变量 `APP_DEFAULT_PASSWORD`（未设置时回退读取 `DEFAULT_PASSWORD`）初始化 `email_owner` 账号的登录密码，后续可在配置页修改；若未提供且配置中没有密码，系统会拒绝所有登录请求。
 - 首次访问浏览器会跳转至登录页，使用 `email_owner` + 设置的密码登录。
 - 登录后：
   1. 进入“配置”页面，填写 IMAP/POP3/SMTP/DeepSeek 参数，必要时点击“验证并获取邮箱列表”以拉取可选文件夹。
@@ -133,11 +133,12 @@ Python 应用无需编译，但建议使用 WSGI 服务器托管，并与调度�
 2. 构建并运行：
    ```bash
    docker build -t mail-trans .
-   docker run -d --name mail-trans -p 6006:6006 \
-     -v $(pwd)/config.json:/app/config.json \
-     -v $(pwd)/logs.json:/app/logs.json \
-     -v $(pwd)/queue.db:/app/queue.db \
-     mail-trans --pwd <初始密码>
+  docker run -d --name mail-trans -p 6006:6006 \
+    -e APP_DEFAULT_PASSWORD=<初始密码> \
+    -v $(pwd)/config.json:/app/config.json \
+    -v $(pwd)/logs.json:/app/logs.json \
+    -v $(pwd)/queue.db:/app/queue.db \
+    mail-trans
    ```
    > 若使用 Docker，请确保挂载配置、日志与队列数据库文件，避免容器重建导致数据丢失。
 
@@ -157,7 +158,7 @@ Python 应用无需编译，但建议使用 WSGI 服务器托管，并与调度�
 
 ## 身份认证
 - 系统内置账号：`email_owner`。
-- 首次启动可通过 `python app.py --pwd <密码>` 初始化密码；也可在配置页的“更新登录密码”区域修改。
+- 首次启动可通过 `python app.py --pwd <密码>` 或设置环境变量 `APP_DEFAULT_PASSWORD` 初始化密码；也可在配置页的“更新登录密码”区域修改。
 - 密码以加盐 MD5 形式存储于 `config.json` 的 `auth.email_owner.password_hash` 字段。
 - 所有受保护页面均需登录，退出可点击右上角“退出登录”。
 
@@ -173,7 +174,7 @@ Python 应用无需编译，但建议使用 WSGI 服务器托管，并与调度�
 - **DeepSeek 调用失败**：检查网络连通性与 token 是否有效；代码中已做降级处理，仍建议在日志中排查异常信息。
 - **未收到汇总邮件**：确认 SMTP 凭证与端口设置正确，必要时开启邮箱的“允许第三方应用”或“授权码”功能；查看队列状态是否存在失败任务。
 - **定时任务未执行**：确保进程未被守护程序杀死，可查看首页的“下一次执行时间”与 `logs.json`；生产环境建议结合 systemd 监控。
-- **无法登录**：确认启动时是否传入 `--pwd` 或在配置中已设置密码；若忘记密码，可删除 `config.json` 中的 `auth` 字段并重新启动传入新密码。
+- **无法登录**：确认启动时是否传入 `--pwd`、配置了 `APP_DEFAULT_PASSWORD`（或 `DEFAULT_PASSWORD`）或在配置中已设置密码；若忘记密码，可删除 `config.json` 中的 `auth` 字段并重新启动传入新密码。
 
 ## 许可证
 此项目仅供学习和内部使用，未经授权请勿用于商业用途。
