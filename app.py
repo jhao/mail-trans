@@ -171,6 +171,12 @@ def initialize_auth(default_password: str | None = None) -> None:
 
     global AUTH_PASSWORD_HASH
 
+    if not default_password:
+        env_password = os.environ.get('APP_DEFAULT_PASSWORD') or os.environ.get('DEFAULT_PASSWORD')
+        if env_password:
+            logging.info("未检测到启动参数中的密码，使用环境变量初始化登录密码。")
+            default_password = env_password
+
     config = load_config()
     stored_hash = _extract_password_hash(config)
     if stored_hash:
